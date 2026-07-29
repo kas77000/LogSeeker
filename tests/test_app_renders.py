@@ -1,0 +1,196 @@
+"""Render the pages headlessly with Streamlit's AppTest and assert no exceptions.
+
+Catches the class of mistake unit tests miss: a wrong widget kwarg, a bad icon
+name, a page referencing session state that was never set.
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+from streamlit.testing.v1 import AppTest  # noqa: E402
+
+
+def _app(**session) -> AppTest:
+    at = AppTest.from_file(str(ROOT / "streamlit_app.py"), default_timeout=30)
+    for key, value in session.items():
+        at.session_state[key] = value
+    return at
+
+
+def _no_exceptions(at: AppTest) -> None:
+    assert not at.exception, "\n\n".join(str(e.value) for e in at.exception)
+
+
+def _order_id_input(at: AppTest):
+    """The order id box on the search form.
+
+    text_input[0] is the sidebar "Your name" field, so index by label rather
+    than position — otherwise this test silently drives the wrong widget.
+    """
+    for widget in at.text_input:
+        if widget.label == "Order id":
+            return widget
+    raise AssertionError(f"no 'Order id' input; found {[w.label for w in at.text_input]}")
+
+
+def test_search_page_renders_with_no_sign_in():
+    """There is no login gate — the search page must come up immediately."""
+    at = _app().run()
+    _no_exceptions(at)
+    assert any("Search order logs" in h.value for h in at.title)
+    assert _order_id_input(at) is not None
+
+
+def test_no_sign_in_warning_is_shown_without_a_network_allowlist():
+    at = _app().run()
+    _no_exceptions(at)
+    assert any("no sign-in" in w.value for w in at.warning), \
+        "the open-access warning must be visible when allowed_networks is empty"
+
+
+def test_results_page_renders():
+    at = _app()
+    at.run()
+    _no_exceptions(at)
+    at.switch_page("app_pages/results.py").run()
+    _no_exceptions(at)
+    assert any("Results" in h.value for h in at.title)
+
+
+def test_admin_page_renders():
+    at = _app()
+    at.run()
+    _no_exceptions(at)
+    at.switch_page("app_pages/admin.py").run()
+    _no_exceptions(at)
+    assert any("Admin" in h.value for h in at.title)
+
+
+def test_bad_order_id_shows_an_error_not_a_crash():
+    at = _app().run()
+    _no_exceptions(at)
+    _order_id_input(at).set_value("540000001; rm -rf /")
+    at.button[0].click().run()
+    _no_exceptions(at)
+    assert at.error, "expected a validation error to be shown"
+
+
+def _submit(at, order_id: str):
+    _order_id_input(at).set_value(order_id)
+    [b for b in at.button if b.label == "Search"][0].click().run()
+    return at
+
+
+def test_submitting_a_valid_search_starts_a_job():
+    at = _app(ls_requester_name="tester").run()
+    _no_exceptions(at)
+    _submit(at, "540000001")
+    _no_exceptions(at)
+
+    # AppTest.session_state is not a plain dict — no .get().
+    assert "ls_my_jobs" in at.session_state, "expected a tracked job in session state"
+
+    from logseeker.jobs import get_manager
+
+    job = get_manager().get(at.session_state["ls_my_jobs"][0])
+    assert job is not None
+    assert job.request.pattern == "540000001"
+    # The typed name is a label for the audit trail, not an authenticated user.
+    assert "tester" in job.request.requested_by
+
+
+def test_a_second_search_does_not_replace_the_first():
+    """Submitting again must queue alongside, not drop the running search."""
+    at = _app(ls_requester_name="tester").run()
+    _no_exceptions(at)
+
+    _submit(at, "540000001")
+    _no_exceptions(at)
+    first = at.session_state["ls_my_jobs"][0]
+
+    _submit(at, "540000002")
+    _no_exceptions(at)
+    tracked = list(at.session_state["ls_my_jobs"])
+
+    assert len(tracked) == 2, "both searches should be tracked"
+    assert tracked[0] != first and first in tracked, "newest first, first one kept"
+
+    from logseeker.jobs import get_manager
+
+    manager = get_manager()
+    patterns = {manager.get(j).request.pattern for j in tracked}
+    assert patterns == {"540000001", "540000002"}
+
+
+def test_single_date_is_the_default_and_range_adds_a_second_input():
+    at = _app().run()
+    _no_exceptions(at)
+
+    labels = [d.label for d in at.date_input]
+    assert labels == ["Date"], f"single date should be the default, got {labels}"
+
+    at.session_state["ls_date_mode"] = "Date range"
+    at.run()
+    _no_exceptions(at)
+    labels = [d.label for d in at.date_input]
+    assert labels == ["From", "To"], labels
+
+
+@pytest.mark.skipif(
+    not (ROOT / "demo_logs").exists(),
+    reason="needs demo logs — run `python tools/make_demo.py`",
+)
+def test_large_result_uses_the_two_step_download():
+    """A result over the inline limit must not be attached directly.
+
+    st.download_button holds its payload in memory, so a 60 MB file wired
+    straight into the Results page would be re-read for every row on every
+    rerun. The large path shows a Prepare button, then gzip + raw.
+    """
+    import time
+    from datetime import date, timedelta
+
+    from logseeker.config import get_settings
+    from logseeker.jobs import get_manager
+    from logseeker.search import MATCH_REGEX, SearchRequest, date_range, validate
+
+    settings = get_settings()
+    manager = get_manager()
+    job = manager.submit(validate(SearchRequest(
+        pattern="pingOrderStream",
+        instances=settings.instances,
+        dates=date_range(date.today() - timedelta(days=4), date.today()),
+        match_mode=MATCH_REGEX,
+        requested_by="large-download-test",
+    ), settings))
+
+    deadline = time.time() + 90
+    while not job.status.is_terminal and time.time() < deadline:
+        time.sleep(0.1)
+    assert job.status.name == "DONE", job.error
+    assert job.result_path.stat().st_size > settings.inline_download_bytes
+
+    at = _app()
+    at.run()
+    at.switch_page("app_pages/results.py").run()
+    _no_exceptions(at)
+
+    prepare = [b for b in at.button if "Prepare download" in b.label]
+    assert prepare, "large result should offer a Prepare button, not a direct download"
+
+    prepare[0].click().run()
+    _no_exceptions(at)
+    labels = [d.label for d in at.get("download_button")]
+    assert any(".gz" in l for l in labels), labels
+    assert any("raw .txt" in l for l in labels), labels
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-q"]))

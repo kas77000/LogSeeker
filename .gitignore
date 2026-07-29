@@ -1,0 +1,15 @@
+# Secrets — never commit. .env holds the operator's log-host login.
+.env
+.streamlit/secrets.toml
+
+# Runtime artefacts
+data/
+demo_logs/
+legacy/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/

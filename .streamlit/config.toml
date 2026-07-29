@@ -1,0 +1,17 @@
+[theme]
+base = "dark"
+primaryColor = "#4C8DF6"
+backgroundColor = "#0E1117"
+secondaryBackgroundColor = "#1A1F2B"
+textColor = "#E6E9EF"
+font = "sans serif"
+
+[server]
+# Nothing is ever uploaded to this app, so keep the limit minimal.
+maxUploadSize = 5
+# Leave XSRF protection on. It implies CORS restrictions, so do not also set
+# enableCORS = false — Streamlit overrides it back to true and logs a warning.
+enableXsrfProtection = true
+
+[browser]
+gatherUsageStats = false
