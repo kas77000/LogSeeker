@@ -41,6 +41,7 @@ You need:
 | | |
 |---|---|
 | **The right machine** | The Windows box belonging to someone who can already SSH to `loghost.example.internal`. The app inherits *his* access; it cannot grant access nobody has. |
+| **A working login on the log host** | Just the username and password you already type. **No admin rights on the log host are required, and nothing on it is modified.** |
 | **Python 3.10 or newer** | `python --version`. Anaconda is fine. |
 | **An SSH client** | `ssh -V`. Built into Windows 10/11; otherwise install Git for Windows. |
 | **Ability to leave it running** | Colleagues can only use the app while the machine is on and the process is up. |
@@ -88,67 +89,56 @@ Remove-Item -Recurse demo_logs
 
 ---
 
-## Step 3 — Give the app its own SSH key
+## Step 3 — Connect to the log host once, by hand
 
-Do not reuse your personal interactive key. A dedicated key can be revoked on
-its own if the app is ever retired or compromised, and it makes the server-side
-logs show which connections came from LogSeeker.
+Nothing has to be installed or configured on the server. LogSeeker signs in with
+your ordinary login, exactly as you would at a prompt — **no admin rights on the
+log host are needed, and nothing there changes.**
 
-```powershell
-ssh-keygen -t ed25519 -f "$env:USERPROFILE\.ssh\logseeker_ed25519" -C "logseeker"
-```
-
-Press Enter twice to leave the passphrase empty. (A passphrase would have to be
-stored in `.env` next to the key to allow unattended start-up, which buys you
-nothing — protect the key with file permissions instead.)
-
-If the log host is older AIX/Solaris and rejects ed25519, use RSA instead:
+Open PowerShell and connect the way you normally would:
 
 ```powershell
-ssh-keygen -t rsa -b 4096 -f "$env:USERPROFILE\.ssh\logseeker_rsa" -C "logseeker"
+ssh youruser@loghost.example.internal
 ```
 
-Install the public half on the log host:
+The first time, `ssh` asks:
 
-```powershell
-Get-Content "$env:USERPROFILE\.ssh\logseeker_ed25519.pub" |
-    ssh youruser@loghost.example.internal "mkdir -p ~/.ssh && chmod 700 ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"
+```
+The authenticity of host 'loghost.example.internal' can't be established.
+ED25519 key fingerprint is SHA256:...
+Are you sure you want to continue connecting (yes/no)?
 ```
 
-Check it works without a password:
+Type **`yes`**. That writes the host's key into `C:\Users\<you>\.ssh\known_hosts`
+on *your* machine, which is how the app later tells the real server from an
+impostor. It is a local file — it needs nothing from the server.
 
-```powershell
-ssh -i "$env:USERPROFILE\.ssh\logseeker_ed25519" youruser@loghost.example.internal "echo OK; ls /apps/k/algologs/ap"
+Then type your password, and once you are on the host:
+
+```bash
+ls /apps/k/algologs/ap
 ```
 
-You should see `OK` and a list of instance directories, with no password prompt.
-**That command also tells you the real instance names** — note them down for
-step 5.
+**Note down what that prints** — those are the real instance names, and they go
+into `LOGSEEKER_INSTANCES` in step 5. Type `exit` to come back.
+
+If that worked, you have everything the app needs: a host, a username, a
+password, and a pinned host key.
 
 ---
 
-## Step 4 — Pin the log host's key
-
-Skip this and the app will refuse to connect (by design — an unverified host key
-means you cannot tell the real server from an impostor).
-
-The `ssh` command in step 3 already added the host to your `known_hosts` on
-first connection, when it asked *"Are you sure you want to continue connecting?"*.
-So just point LogSeeker at that file — it is at:
-
-```
-C:\Users\<you>\.ssh\known_hosts
-```
-
-Confirm the entry exists:
+## Step 4 — Confirm the host key was saved
 
 ```powershell
-Select-String -Path "$env:USERPROFILE\.ssh\known_hosts" -Pattern "loghost.example.internal"
+Select-String -Path "$env:USERPROFILE\.ssh\known_hosts" -Pattern "loghost"
 ```
 
-If it is missing, connect once with `ssh` and accept the fingerprint, then check
-again. Prefer this over `ssh-keyscan`, which fetches whatever key the network
-hands it and verifies nothing.
+One or more lines means you are set — leave `LOGSEEKER_SSH_KNOWN_HOSTS` blank in
+step 5 and the app uses this file automatically.
+
+Nothing printed means the fingerprint was never accepted. Repeat step 3 and
+answer `yes` at the prompt. Do not reach for `ssh-keyscan` instead — it accepts
+whatever key the network hands back, which is precisely the check being skipped.
 
 ---
 
@@ -159,14 +149,14 @@ Copy-Item .env.example .env
 notepad .env
 ```
 
-The settings that must be right:
+The settings that must be right — the same four things you typed in step 3:
 
 ```ini
 LOGSEEKER_BACKEND=ssh
 LOGSEEKER_SSH_HOST=loghost.example.internal
 LOGSEEKER_SSH_USER=youruser
-LOGSEEKER_SSH_KEY_PATH=C:/Users/youruser/.ssh/logseeker_ed25519
-LOGSEEKER_SSH_KNOWN_HOSTS=C:/Users/youruser/.ssh/known_hosts
+LOGSEEKER_SSH_PASSWORD=your-log-host-password
+LOGSEEKER_SSH_KNOWN_HOSTS=
 
 LOGSEEKER_LOG_DIR_TEMPLATE=/apps/k/algologs/ap/{instance}/logs
 LOGSEEKER_LOG_GLOB_TEMPLATE=APA*_pingOrderStream_{date}*.out
@@ -175,13 +165,22 @@ LOGSEEKER_INSTANCES=APIA,APIE
 
 Notes that save time:
 
-- **Use forward slashes** in Windows paths. Backslashes in a `.env` are a common
-  cause of "key not found".
+- **The password is plain text here, deliberately.** This file is the one place
+  your login lives, so it is obvious where to change it and what to delete when
+  the app is retired. It is also the only thing that has to change when your
+  password expires — edit it and restart.
+- **`.env` is gitignored.** Keep it that way. Anyone who can read this file can
+  log in as you, so on a shared machine lock it down:
+  `icacls .env /inheritance:r /grant:r "%USERNAME%:R"`
+- **Leave `LOGSEEKER_SSH_KNOWN_HOSTS` blank.** The app then uses the
+  `C:\Users\<you>\.ssh\known_hosts` that step 3 populated. Set a path only if you
+  deliberately keep a separate file.
+- **Use forward slashes** in any Windows path. Backslashes in a `.env` are a
+  common cause of "file not found".
 - `{instance}` and `{date}` are placeholders the app fills in. Leave them alone;
   change the text around them.
 - `LOGSEEKER_INSTANCES` is an **allowlist** — an instance not in this list cannot
   be searched at all. Put the real names from step 3 here.
-- `.env` is gitignored. It holds your log-host access; treat it like a password.
 
 ---
 
@@ -442,10 +441,11 @@ Reach for these in order — the first is usually enough:
 
 | Symptom | Cause and fix |
 |---|---|
-| **"no ssh_known_hosts file configured…"** on every page | Step 4. Set `LOGSEEKER_SSH_KNOWN_HOSTS`. |
-| **"SSH connection failed: Server ... not found in known_hosts"** | The host key is not pinned. `ssh youruser@loghost.example.internal` once, accept the fingerprint, retry. |
-| **"SSH connection failed: Authentication failed"** | Public key not installed, or wrong `SSH_KEY_PATH`. Re-run the `ssh -i ...` check at the end of step 3. |
-| **"ssh_key_path does not exist"** | Backslashes in `.env`. Use forward slashes: `C:/Users/...`. |
+| **"the log host's key is not pinned…"** on every page | Step 3 was never completed. `ssh youruser@loghost.example.internal` once and answer `yes` at the fingerprint prompt. |
+| **"SSH connection failed: Server ... not found in known_hosts"** | Same cause: the host key is not pinned. Connect once by hand, accept the fingerprint, retry. |
+| **"SSH connection failed: Authentication failed"** | Wrong `LOGSEEKER_SSH_PASSWORD` or `LOGSEEKER_SSH_USER`. Check by running `ssh youruser@loghost.example.internal` by hand — if that prompts you again, the password is wrong. Also check the password has not expired, and that it contains no stray quotes in `.env`. |
+| **Password ends in a space, or starts *and* ends with a quote** | Wrap the value in double quotes: `LOGSEEKER_SSH_PASSWORD="p@ss "`. Unquoted values are trimmed, and a value that both starts and ends with the same quote character has them stripped. `#`, `$`, `=`, `\` and interior spaces all need no quoting. |
+| **Worked yesterday, "Authentication failed" today** | The account's password expired or was rotated. Update `LOGSEEKER_SSH_PASSWORD` in `.env` and restart. |
 | **"No log files exist for that instance/date"** | Non-trading day, wrong instance, or a wrong path template. Use **Admin → Log directory probe** to see what is really there. |
 | **Searches return nothing but the probe finds files** | The order id is not in those logs, or you are on the wrong instance. Try regex mode with a fragment of the id. |
 | **App searches fake data** | A leftover `.streamlit\secrets.toml` from the demo. Delete it. Check **Admin → Configuration → source**. |
@@ -475,9 +475,9 @@ setting.
 | `BACKEND` | `ssh` | `ssh`, or `local` if the app runs on the log host itself |
 | `SSH_HOST` / `SSH_PORT` | — / `22` | The log host |
 | `SSH_USER` | — | **The operator's login.** Every visitor searches as this account. |
-| `SSH_KEY_PATH` | — | Private key for the app |
-| `SSH_PASSWORD` | — | Alternative to a key; prefer the key |
-| `SSH_KNOWN_HOSTS` | — | Host key verification |
+| `SSH_PASSWORD` | — | **The operator's log-host password.** Plain text, by design. |
+| `SSH_KEY_PATH` | — | Optional. Only if your site already uses key auth. |
+| `SSH_KNOWN_HOSTS` | *(empty)* | Host key verification. Blank uses `~/.ssh/known_hosts`. |
 | `SSH_AUTO_ADD_HOST_KEY` | `false` | Disables host verification. First connection only. |
 | `LOG_DIR_TEMPLATE` | `/apps/k/algologs/ap/{instance}/logs` | Where logs live |
 | `LOG_GLOB_TEMPLATE` | `APA*_pingOrderStream_{date}*.out` | Which files to scan |
@@ -602,7 +602,13 @@ renders of all three pages via `streamlit.testing.v1.AppTest`.
    not simply `{instance}*`. If that is a typo in the original,
    `LOG_GLOB_TEMPLATE` is where to fix it.
 3. **Confirm the instance list** against what step 3's `ls` showed.
-4. **Consider a dedicated service account.** Every search reaches the log host as
-   `SSH_USER`, so the server-side trail will show one person doing everything. A
-   read-only account named for the app keeps that trail honest and can be revoked
-   without touching anyone's personal login.
+4. **Know what the password in `.env` gives away.** The app signs in with the
+   operator's own account, so that file grants everything that account can do on
+   the log host — not just reading logs. Restrict the file
+   (`icacls .env /inheritance:r /grant:r "%USERNAME%:R"`), and if the desk ever
+   *can* get a read-only account named for the app, moving to it costs one line
+   in `.env` and makes the server-side trail honest — right now it shows one
+   person doing everything.
+5. **Have a plan for password expiry.** When the operator's password rotates the
+   app stops working, with `Authentication failed` on every search. One line in
+   `.env` and a restart fixes it; knowing that in advance saves an outage.

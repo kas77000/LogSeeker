@@ -27,6 +27,11 @@ APP_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DATA_DIR = APP_ROOT / "data"
 DOTENV_PATH = APP_ROOT / ".env"
 
+# Where OpenSSH — and therefore paramiko's load_system_host_keys() — keeps host
+# keys. When ssh_known_hosts is unset this is what actually gets used, so the
+# config check has to look here before declaring the host key unpinned.
+DEFAULT_KNOWN_HOSTS = Path.home() / ".ssh" / "known_hosts"
+
 
 @lru_cache(maxsize=1)
 def _dotenv() -> dict[str, str]:
@@ -124,9 +129,12 @@ class Settings:
     ssh_host: str = ""
     ssh_port: int = 22
     ssh_user: str = ""
-    ssh_password: str = ""
+    # repr=False so the password cannot ride along in a traceback or a log line
+    # that happens to render the settings object. It is deliberately plain text
+    # in .env; that is the one place it should be readable.
+    ssh_password: str = field(default="", repr=False)
     ssh_key_path: str = ""
-    ssh_key_passphrase: str = ""
+    ssh_key_passphrase: str = field(default="", repr=False)
     ssh_known_hosts: str = ""
     ssh_auto_add_host_key: bool = False
     ssh_connect_timeout: int = 20
@@ -235,13 +243,24 @@ def config_problems(settings: Settings) -> list[str]:
         if not settings.ssh_user:
             problems.append("ssh_user is not set")
         if not settings.ssh_password and not settings.ssh_key_path:
-            problems.append("neither ssh_key_path nor ssh_password is set")
+            problems.append(
+                "neither ssh_password nor ssh_key_path is set — put the log-host "
+                "password in LOGSEEKER_SSH_PASSWORD"
+            )
         if settings.ssh_key_path and not Path(settings.ssh_key_path).expanduser().exists():
             problems.append(f"ssh_key_path does not exist: {settings.ssh_key_path}")
-        if not settings.ssh_known_hosts and not settings.ssh_auto_add_host_key:
+        # An unset ssh_known_hosts is not a failure: paramiko falls back to the
+        # default OpenSSH file, which one `ssh user@host` populates. Only say the
+        # host key is unpinned when there is genuinely nothing to pin against.
+        if (
+            not settings.ssh_known_hosts
+            and not settings.ssh_auto_add_host_key
+            and not DEFAULT_KNOWN_HOSTS.exists()
+        ):
             problems.append(
-                "no ssh_known_hosts file configured and ssh_auto_add_host_key is false — "
-                "the connection will be refused"
+                f"the log host's key is not pinned: {DEFAULT_KNOWN_HOSTS} does not exist "
+                "and ssh_known_hosts is unset, so the connection will be refused. "
+                "Run `ssh <user>@<host>` once and accept the fingerprint."
             )
     if not settings.instances:
         problems.append("no instances configured")

@@ -127,5 +127,93 @@ def config_problems_for(settings: Settings):
     return config_problems(settings)
 
 
+# --------------------------------------------------------------------------- #
+# Password auth — the deployment this is actually used in.
+#
+# There are no admin rights on the log host, so a key cannot be installed there.
+# The operator's ordinary password goes in .env and the app signs in with it,
+# exactly as a person would at a prompt. These tests pin that path down so a
+# later change cannot quietly make a key mandatory again.
+# --------------------------------------------------------------------------- #
+
+def _password_settings(**kw) -> Settings:
+    base = dict(
+        backend="ssh",
+        ssh_host="loghost.example.internal",
+        ssh_user="youruser",
+        ssh_password="s3cret",
+    )
+    base.update(kw)
+    return Settings(**base)
+
+
+def test_a_password_alone_is_a_complete_configuration(monkeypatch, tmp_path):
+    """No key, no explicit known_hosts — just host, user and password."""
+    known = tmp_path / "known_hosts"
+    known.write_text("loghost.example.internal ssh-ed25519 AAAA\n", encoding="utf-8")
+    monkeypatch.setattr(config_mod, "DEFAULT_KNOWN_HOSTS", known)
+
+    assert config_problems_for(_password_settings()) == []
+
+
+def test_missing_host_key_is_reported_only_when_nothing_can_pin_it(monkeypatch, tmp_path):
+    """The old message claimed the connection 'will be refused' whenever
+    ssh_known_hosts was unset. That was wrong: paramiko falls back to the
+    default OpenSSH file, so an operator who has ever run `ssh host` is fine.
+    Warn only when that file genuinely does not exist."""
+    monkeypatch.setattr(config_mod, "DEFAULT_KNOWN_HOSTS", tmp_path / "absent")
+    problems = config_problems_for(_password_settings())
+    assert any("not pinned" in p for p in problems)
+
+    present = tmp_path / "known_hosts"
+    present.write_text("x\n", encoding="utf-8")
+    monkeypatch.setattr(config_mod, "DEFAULT_KNOWN_HOSTS", present)
+    assert not any("not pinned" in p for p in config_problems_for(_password_settings()))
+
+
+def test_a_password_is_not_required_to_also_carry_a_key(monkeypatch, tmp_path):
+    """A key path that does not exist is still an error; a password-only
+    configuration must not trip that check."""
+    known = tmp_path / "known_hosts"
+    known.write_text("x\n", encoding="utf-8")
+    monkeypatch.setattr(config_mod, "DEFAULT_KNOWN_HOSTS", known)
+
+    assert not any("ssh_key_path" in p for p in config_problems_for(_password_settings()))
+    problems = config_problems_for(
+        _password_settings(ssh_key_path=str(tmp_path / "nope"))
+    )
+    assert any("ssh_key_path does not exist" in p for p in problems)
+
+
+def test_the_password_never_appears_in_the_settings_repr():
+    """It is plain text in .env on purpose, but a traceback or a stray log line
+    that renders Settings must not carry it along."""
+    settings = _password_settings(ssh_key_passphrase="also-secret")
+    text = repr(settings)
+    assert "s3cret" not in text
+    assert "also-secret" not in text
+    assert "youruser" in text          # non-secret fields still shown
+
+
+def test_password_survives_awkward_characters_in_dotenv(monkeypatch, tmp_path):
+    """Real passwords contain punctuation. Anything the parser mangles would
+    show up as an unexplained 'Authentication failed'."""
+    cases = {
+        "hash": ("p@ss#1", "p@ss#1"),
+        "equals": ("a=b=c", "a=b=c"),
+        "dollar": ("p$ss", "p$ss"),
+        "backslash": (r"dom\user", r"dom\user"),
+        "interior spaces": ("p ss word", "p ss word"),
+        "quoted trailing space": ('"abc   "', "abc   "),
+    }
+    for label, (written, expected) in cases.items():
+        env = tmp_path / f"{label}.env"
+        env.write_text(f"LOGSEEKER_SSH_PASSWORD={written}\n", encoding="utf-8")
+        monkeypatch.setattr(config_mod, "DOTENV_PATH", env)
+        config_mod._dotenv.cache_clear()
+        assert config_mod._dotenv()["LOGSEEKER_SSH_PASSWORD"] == expected, label
+    config_mod._dotenv.cache_clear()
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))
