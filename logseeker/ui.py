@@ -9,6 +9,29 @@ import streamlit as st
 from . import store
 from .jobs import Job, JobStatus
 
+# Wide layout is right for this app — the results rows and the log preview both
+# want room. But uncapped it keeps growing, and on a 34" monitor a status card
+# stretches far enough that its badge sits a hand's width from the order id it
+# belongs to. Cap the content column instead of dropping back to layout="centered",
+# which would squeeze the previews.
+CONTENT_MAX_WIDTH = 1200
+
+
+def apply_content_width() -> None:
+    """Cap and centre the main content column. Call once, after set_page_config."""
+    st.markdown(
+        f"""
+        <style>
+          [data-testid="stMainBlockContainer"] {{
+              max-width: {CONTENT_MAX_WIDTH}px;
+              margin-inline: auto;
+          }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 STATUS_BADGE = {
     JobStatus.QUEUED: ("Queued", "gray", ":material/schedule:"),
     JobStatus.LISTING: ("Finding logs", "blue", ":material/folder_open:"),

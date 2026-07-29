@@ -9,7 +9,7 @@ searches as him.
 
 import streamlit as st
 
-from logseeker import access
+from logseeker import access, ui
 from logseeker.config import config_problems, get_settings
 from logseeker.jobs import get_manager
 
@@ -18,6 +18,7 @@ st.set_page_config(
     page_icon=":material/travel_explore:",
     layout="wide",
 )
+ui.apply_content_width()
 
 settings = get_settings()
 
