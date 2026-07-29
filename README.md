@@ -584,7 +584,7 @@ finishes**, so a completed 60 MB result is not re-rendered every second.
 python -m pytest tests -q
 ```
 
-50 tests covering: input validation including a dozen shell-injection attempts;
+67 tests covering: input validation including a dozen shell-injection attempts;
 command construction and glob quoting; request identity and filename collisions;
 the CIDR allowlist and its fail-closed behaviour; config resolution order; the
 line, byte and disk caps *and their warnings*; gzip reuse; cache-hit metadata;
