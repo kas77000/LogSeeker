@@ -95,6 +95,10 @@ Nothing has to be installed or configured on the server. LogSeeker signs in with
 your ordinary login, exactly as you would at a prompt — **no admin rights on the
 log host are needed, and nothing there changes.**
 
+> **Two ways to sign in.** This step is common to both. At the end of it, step 3A
+> (password) works immediately; step 3B (SSH key) is the upgrade to take when you
+> can put a key on the log host. You can run both at once during the switch.
+
 Open PowerShell and connect the way you normally would:
 
 ```powershell
@@ -127,6 +131,92 @@ password, and a pinned host key.
 
 ---
 
+## Step 3A — Sign in with your password *(start here)*
+
+Nothing more to do. Put the password you just typed into `.env` at step 5:
+
+```ini
+LOGSEEKER_SSH_PASSWORD=your-log-host-password
+```
+
+That is the whole method. It needs no cooperation from anyone, nothing is
+installed on the server, and it is closest to what the legacy WinSCP chain did —
+that prompted for the same password.
+
+Two costs, both manageable: the password sits in plain text in `.env` (so
+restrict the file — step 5), and **when your password rotates the app stops
+working** until you edit that line and restart.
+
+---
+
+## Step 3B — Sign in with an SSH key *(better, when you can)*
+
+Take this route as soon as you are able to append a key to `~/.ssh/authorized_keys`
+on the log host. It is worth the effort for three reasons:
+
+- it survives password rotation, so the app stops breaking every 90 days;
+- it can be revoked on its own, without touching your login;
+- the server-side trail shows which connections came from LogSeeker rather than
+  from you at a terminal.
+
+**Installing it needs no admin rights** — `authorized_keys` lives in your own
+home directory. It does need the host to permit key auth, which is the only
+reason this is not the default.
+
+Generate a key **for the app**, not your personal interactive one:
+
+```powershell
+ssh-keygen -t ed25519 -f "$env:USERPROFILE\.ssh\logseeker_ed25519" -C "logseeker"
+```
+
+Press Enter twice for an empty passphrase. A passphrase would have to be stored
+in `.env` right next to the key for unattended start-up, which protects nothing —
+use file permissions instead.
+
+If the host is older AIX/Solaris and rejects ed25519, use RSA:
+
+```powershell
+ssh-keygen -t rsa -b 4096 -f "$env:USERPROFILE\.ssh\logseeker_rsa" -C "logseeker"
+```
+
+Install the public half (this prompts for your password one last time):
+
+```powershell
+Get-Content "$env:USERPROFILE\.ssh\logseeker_ed25519.pub" |
+    ssh youruser@loghost.example.internal "mkdir -p ~/.ssh && chmod 700 ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"
+```
+
+Confirm it works **without** a password prompt:
+
+```powershell
+ssh -i "$env:USERPROFILE\.ssh\logseeker_ed25519" youruser@loghost.example.internal "echo OK"
+```
+
+Then add the key to `.env` at step 5:
+
+```ini
+LOGSEEKER_SSH_KEY_PATH=C:/Users/youruser/.ssh/logseeker_ed25519
+```
+
+### Switching from the password to a key later
+
+You do not need a flag day. **paramiko tries keys before passwords**, so if both
+`LOGSEEKER_SSH_KEY_PATH` and `LOGSEEKER_SSH_PASSWORD` are set, the key is used
+and the password is only a fallback.
+
+1. Leave `LOGSEEKER_SSH_PASSWORD` exactly where it is.
+2. Add `LOGSEEKER_SSH_KEY_PATH` and restart.
+3. Open **Admin → Health**. It states which credential is in use — you are
+   looking for *"SSH key, with the password as fallback"*.
+4. Once that reads correctly and a search works, delete the password line and
+   restart. Admin should then say *"SSH key"*.
+
+If the key is wrong or not installed, step 3 silently falls back to the password
+and everything keeps working — which is why checking Admin matters rather than
+assuming the key took effect.
+
+---
+
 ## Step 4 — Confirm the host key was saved
 
 ```powershell
@@ -149,19 +239,27 @@ Copy-Item .env.example .env
 notepad .env
 ```
 
-The settings that must be right — the same four things you typed in step 3:
+The settings that must be right — the same things you typed in step 3:
 
 ```ini
 LOGSEEKER_BACKEND=ssh
 LOGSEEKER_SSH_HOST=loghost.example.internal
 LOGSEEKER_SSH_USER=youruser
-LOGSEEKER_SSH_PASSWORD=your-log-host-password
 LOGSEEKER_SSH_KNOWN_HOSTS=
+
+# --- sign-in: step 3A, step 3B, or both during a switch ---
+LOGSEEKER_SSH_PASSWORD=your-log-host-password
+#LOGSEEKER_SSH_KEY_PATH=C:/Users/youruser/.ssh/logseeker_ed25519
 
 LOGSEEKER_LOG_DIR_TEMPLATE=/apps/k/algologs/ap/{instance}/logs
 LOGSEEKER_LOG_GLOB_TEMPLATE=APA*_pingOrderStream_{date}*.out
 LOGSEEKER_INSTANCES=APIA,APIE
 ```
+
+**Uncomment the key line and keep the password** while you switch to a key —
+the key is tried first, so the password just sits there as a safety net until
+you confirm the key works and delete it. **Admin → Health** tells you which one
+is actually being used.
 
 Notes that save time:
 
@@ -445,7 +543,10 @@ Reach for these in order — the first is usually enough:
 | **"SSH connection failed: Server ... not found in known_hosts"** | Same cause: the host key is not pinned. Connect once by hand, accept the fingerprint, retry. |
 | **"SSH connection failed: Authentication failed"** | Wrong `LOGSEEKER_SSH_PASSWORD` or `LOGSEEKER_SSH_USER`. Check by running `ssh youruser@loghost.example.internal` by hand — if that prompts you again, the password is wrong. Also check the password has not expired, and that it contains no stray quotes in `.env`. |
 | **Password ends in a space, or starts *and* ends with a quote** | Wrap the value in double quotes: `LOGSEEKER_SSH_PASSWORD="p@ss "`. Unquoted values are trimmed, and a value that both starts and ends with the same quote character has them stripped. `#`, `$`, `=`, `\` and interior spaces all need no quoting. |
-| **Worked yesterday, "Authentication failed" today** | The account's password expired or was rotated. Update `LOGSEEKER_SSH_PASSWORD` in `.env` and restart. |
+| **Worked yesterday, "Authentication failed" today** | On step 3A, the account's password expired or was rotated. Update `LOGSEEKER_SSH_PASSWORD` and restart. This is the failure step 3B removes. |
+| **Added a key but it still uses the password** | The key was never accepted by the host, so paramiko fell through to the password. Check **Admin → Health → Signing in with**; if it says *"SSH key, with the password as fallback"* the key is being *offered*, not necessarily accepted. Prove it outside the app: `ssh -i <key> youruser@loghost "echo OK"` must not prompt. |
+| **"ssh_key_path does not exist"** | Backslashes in `.env`. Use forward slashes: `C:/Users/...`. |
+| **Key works by hand, fails in the app** | Usually a passphrase on the key. Either regenerate it without one (step 3B) or set `LOGSEEKER_SSH_KEY_PASSPHRASE`. Note paramiko falls back to using `SSH_PASSWORD` as the passphrase when none is set, which can mask the real cause. |
 | **"No log files exist for that instance/date"** | Non-trading day, wrong instance, or a wrong path template. Use **Admin → Log directory probe** to see what is really there. |
 | **Searches return nothing but the probe finds files** | The order id is not in those logs, or you are on the wrong instance. Try regex mode with a fragment of the id. |
 | **App searches fake data** | A leftover `.streamlit\secrets.toml` from the demo. Delete it. Check **Admin → Configuration → source**. |
@@ -475,8 +576,9 @@ setting.
 | `BACKEND` | `ssh` | `ssh`, or `local` if the app runs on the log host itself |
 | `SSH_HOST` / `SSH_PORT` | — / `22` | The log host |
 | `SSH_USER` | — | **The operator's login.** Every visitor searches as this account. |
-| `SSH_PASSWORD` | — | **The operator's log-host password.** Plain text, by design. |
-| `SSH_KEY_PATH` | — | Optional. Only if your site already uses key auth. |
+| `SSH_PASSWORD` | — | **Step 3A.** The operator's log-host password, plain text by design. |
+| `SSH_KEY_PATH` | — | **Step 3B.** Private key for the app. **Set with `SSH_PASSWORD`, this wins** — the password becomes a fallback. |
+| `SSH_KEY_PASSPHRASE` | — | Leave empty. Stored next to the key, it protects nothing. |
 | `SSH_KNOWN_HOSTS` | *(empty)* | Host key verification. Blank uses `~/.ssh/known_hosts`. |
 | `SSH_AUTO_ADD_HOST_KEY` | `false` | Disables host verification. First connection only. |
 | `LOG_DIR_TEMPLATE` | `/apps/k/algologs/ap/{instance}/logs` | Where logs live |
@@ -609,6 +711,12 @@ renders of all three pages via `streamlit.testing.v1.AppTest`.
    *can* get a read-only account named for the app, moving to it costs one line
    in `.env` and makes the server-side trail honest — right now it shows one
    person doing everything.
-5. **Have a plan for password expiry.** When the operator's password rotates the
-   app stops working, with `Authentication failed` on every search. One line in
-   `.env` and a restart fixes it; knowing that in advance saves an outage.
+5. **Have a plan for password expiry.** On step 3A, when the operator's password
+   rotates the app stops working, with `Authentication failed` on every search.
+   One line in `.env` and a restart fixes it; knowing that in advance saves an
+   outage. **Step 3B removes this failure mode entirely**, which is the main
+   practical argument for moving to a key as soon as you can.
+6. **Ask whether a key is possible yet.** Appending to `~/.ssh/authorized_keys`
+   needs no admin rights on the log host — only that the host permits key auth.
+   It is worth asking early: it is a ten-minute change (step 3B), it can be done
+   alongside the password with no downtime, and it fixes items 4 and 5 at once.

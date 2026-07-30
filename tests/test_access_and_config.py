@@ -195,6 +195,52 @@ def test_the_password_never_appears_in_the_settings_repr():
     assert "youruser" in text          # non-secret fields still shown
 
 
+def test_both_auth_methods_are_supported_and_the_key_is_reported_as_winning(monkeypatch, tmp_path):
+    """Two supported routes: password (step 3A) and key (step 3B).
+
+    paramiko tries keys before passwords, so a configuration carrying both uses
+    the key and keeps the password as a fallback. That is what makes switching
+    safe, and describe_auth() is what the operator checks to confirm the switch
+    actually took — a key that was never installed on the host otherwise looks
+    identical to one that works.
+    """
+    key = tmp_path / "logseeker_ed25519"
+    key.write_text("not-a-real-key\n", encoding="utf-8")
+    known = tmp_path / "known_hosts"
+    known.write_text("x\n", encoding="utf-8")
+    monkeypatch.setattr(config_mod, "DEFAULT_KNOWN_HOSTS", known)
+
+    password_only = _password_settings()
+    assert password_only.describe_auth() == "password"
+    assert config_problems_for(password_only) == []
+
+    key_only = _password_settings(ssh_password="", ssh_key_path=str(key))
+    assert key_only.describe_auth() == "SSH key"
+    assert config_problems_for(key_only) == []
+
+    both = _password_settings(ssh_key_path=str(key))
+    assert both.describe_auth() == "SSH key, with the password as fallback"
+    assert config_problems_for(both) == []
+
+    neither = _password_settings(ssh_password="")
+    assert neither.describe_auth() == "none configured"
+    assert any("ssh_password" in p for p in config_problems_for(neither))
+
+
+def test_describe_auth_never_leaks_the_credential(tmp_path):
+    key = tmp_path / "k"
+    key.write_text("x", encoding="utf-8")
+    for settings in (
+        _password_settings(),
+        _password_settings(ssh_key_path=str(key)),
+    ):
+        assert "s3cret" not in settings.describe_auth()
+
+
+def test_local_backend_reports_auth_as_not_applicable():
+    assert "local" in Settings(backend="local").describe_auth()
+
+
 def test_password_survives_awkward_characters_in_dotenv(monkeypatch, tmp_path):
     """Real passwords contain punctuation. Anything the parser mangles would
     show up as an unexplained 'Authentication failed'."""

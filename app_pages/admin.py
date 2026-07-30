@@ -39,6 +39,11 @@ with tab_health:
 
     st.subheader("Connection test")
     st.caption(f"Target: `{settings.describe_target()}`")
+    # Keys beat passwords in paramiko, so when both are configured the password
+    # is only a fallback. Say which one is live — otherwise a key that was never
+    # installed looks identical to one that works, the password quietly carrying
+    # the app while everyone believes they have moved off it.
+    st.caption(f"Signing in with: **{settings.describe_auth()}**")
 
     if st.button("Test connection", icon=":material/network_check:", type="primary"):
         with st.spinner("Connecting…"):

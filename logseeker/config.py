@@ -193,6 +193,25 @@ class Settings:
         host = self.ssh_host or "?"
         return f"{user}@{host}:{self.ssh_port}"
 
+    def describe_auth(self) -> str:
+        """Which credential will actually be used to sign in.
+
+        paramiko tries keys before passwords, so when both are configured the
+        key wins and the password is only a fallback. That is what makes moving
+        from one to the other safe — you can set both, confirm the key is being
+        used, and only then delete the password. Saying out loud which one is in
+        play removes the single most confusing part of that switch.
+        """
+        if self.backend == "local":
+            return "not applicable — local backend"
+        if self.ssh_key_path and self.ssh_password:
+            return "SSH key, with the password as fallback"
+        if self.ssh_key_path:
+            return "SSH key"
+        if self.ssh_password:
+            return "password"
+        return "none configured"
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
