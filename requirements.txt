@@ -1,3 +1,4 @@
 streamlit>=1.49
 paramiko>=2.8
 pandas>=1.5
+pykx>=2.5

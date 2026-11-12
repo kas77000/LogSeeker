@@ -7,9 +7,9 @@ one of them to run a WinSCP + batch + remote-ksh chain by hand and copy the
 result to a network share. LogSeeker turns that chain into a web app: one of
 those two people hosts it, and everyone else requests logs through the browser.
 
-**There is no sign-in.** The operator launches the app on his machine with his
-own log-host credentials in the environment; every visitor's search runs on the
-server as him. That is deliberate — it is what makes the tool usable by people
+**There is no sign-in.** The operator launches the app on their machine with a
+**service account's** log-host username and password in `.env`; every visitor's
+search runs on the server as that account. That is deliberate — it is what makes the tool usable by people
 who have no server access at all. It also means the URL *is* the credential, so
 [Step 7](#step-7--let-colleagues-in-safely) is not optional.
 
@@ -253,7 +253,7 @@ LOGSEEKER_SSH_PASSWORD=your-log-host-password
 
 LOGSEEKER_LOG_DIR_TEMPLATE=/apps/k/algologs/ap/{instance}/logs
 LOGSEEKER_LOG_GLOB_TEMPLATE=APA*_pingOrderStream_{date}*.out
-LOGSEEKER_INSTANCES=APIA,APIE
+LOGSEEKER_INSTANCES=APIA,APIB,APIC,APID,APIE,APIF,APIG,APIH,APII,APIL,APIM
 ```
 
 **Uncomment the key line and keep the password** while you switch to a key —
@@ -406,6 +406,31 @@ The other two Advanced options are ordinary grep behaviour: **Ignore
 upper/lower case** (`grep -i`), and **Lines of context** (`grep -C`), which
 includes the surrounding lines so you can see what happened either side of a
 match.
+
+## Checking the id in kdb
+
+When `LOGSEEKER_KDB_RDB` and/or `LOGSEEKER_KDB_HDB` are set, every exact-text
+search first asks the OMS `target` table whether the id exists and whose it is:
+
+| Date searched | Asked of | Query |
+|---|---|---|
+| today | RDB | `select trader from target where id_target=<id>` |
+| any earlier date | HDB | `select date, trader from target where date in <dates>, id_target=<id>` |
+
+The card then says **"id_target exists in kdb — trader: …"**, or warns that kdb
+has no such target for those dates, which usually means a mistyped id or the
+wrong date. **The log search runs either way.** kdb being down or missing an id
+never blocks fetching the logs.
+
+`id_target` is a 32-bit int in kdb (`meta target` shows type `i`), so the id is
+sent as an int. An id that is not all digits, or is over 2,147,483,647, cannot
+exist there and is not looked up; the card says why instead of a bare "not
+found". Pattern (regex) searches are not sent to kdb.
+
+pykx connects over IPC only, so no q licence is needed. Each lookup runs in its
+own short-lived Python process (`logseeker/kdbworker/lookup.py`), so a pykx
+failure cannot take the app down. **Admin → Health → kdb** has a connection
+test and a one-off id lookup.
 
 ## Running several searches at once
 
@@ -575,15 +600,19 @@ setting.
 |---|---|---|
 | `BACKEND` | `ssh` | `ssh`, or `local` if the app runs on the log host itself |
 | `SSH_HOST` / `SSH_PORT` | — / `22` | The log host |
-| `SSH_USER` | — | **The operator's login.** Every visitor searches as this account. |
-| `SSH_PASSWORD` | — | **Step 3A.** The operator's log-host password, plain text by design. |
+| `SSH_USER` | — | **The service account's login.** Every visitor searches as this account. |
+| `SSH_PASSWORD` | — | **Step 3A.** The service account's log-host password, plain text by design. |
 | `SSH_KEY_PATH` | — | **Step 3B.** Private key for the app. **Set with `SSH_PASSWORD`, this wins** — the password becomes a fallback. |
 | `SSH_KEY_PASSPHRASE` | — | Leave empty. Stored next to the key, it protects nothing. |
 | `SSH_KNOWN_HOSTS` | *(empty)* | Host key verification. Blank uses `~/.ssh/known_hosts`. |
 | `SSH_AUTO_ADD_HOST_KEY` | `false` | Disables host verification. First connection only. |
+| `KDB_RDB` | *(empty)* | `host:port` of the OMS RDB; checks today's ids |
+| `KDB_HDB` | *(empty)* | `host:port` of the OMS HDB; checks earlier dates |
+| `KDB_USER` / `KDB_PASSWORD` | *(empty)* | Only if the kdb processes require a login |
+| `KDB_TIMEOUT` | `30` | Seconds per kdb query |
 | `LOG_DIR_TEMPLATE` | `/apps/k/algologs/ap/{instance}/logs` | Where logs live |
 | `LOG_GLOB_TEMPLATE` | `APA*_pingOrderStream_{date}*.out` | Which files to scan |
-| `INSTANCES` | `APIA,APIE` | Allowlist; nothing outside it can be searched |
+| `INSTANCES` | `APIA,APIB,APIC,APID,APIE,APIF,APIG,APIH,APII,APIL,APIM` | Allowlist; nothing outside it can be searched |
 | `ALLOWED_NETWORKS` | *(empty)* | CIDR allowlist. The app's only access control. |
 | `SHOW_ADMIN` | `true` | `false` hides the Admin page |
 | `WORKERS` | `3` | Concurrent greps against the log host |
@@ -659,6 +688,8 @@ logseeker/
   store.py             result files, cache, gzip, disk budget
   audit.py             append-only JSONL trail, tail-read from the end
   access.py            CIDR allowlist and audit labelling (no sign-in)
+  kdb.py               id_target check against the OMS RDB/HDB
+  kdbworker/lookup.py  the pykx side, run as a child process
   ui.py                formatting and download controls
 ```
 
@@ -686,11 +717,12 @@ finishes**, so a completed 60 MB result is not re-rendered every second.
 python -m pytest tests -q
 ```
 
-67 tests covering: input validation including a dozen shell-injection attempts;
+93 tests covering: input validation including a dozen shell-injection attempts;
 command construction and glob quoting; request identity and filename collisions;
 the CIDR allowlist and its fail-closed behaviour; config resolution order; the
 line, byte and disk caps *and their warnings*; gzip reuse; cache-hit metadata;
-audit tail-reads; an end-to-end search through the local backend; and headless
+audit tail-reads; kdb RDB/HDB routing, failure reporting and a real
+worker against a dead port; an end-to-end search through the local backend; and headless
 renders of all three pages via `streamlit.testing.v1.AppTest`.
 
 ---

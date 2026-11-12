@@ -17,6 +17,48 @@ sys.path.insert(0, str(ROOT))
 from streamlit.testing.v1 import AppTest  # noqa: E402
 
 
+@pytest.fixture(scope="module", autouse=True)
+def _isolated_demo_config(tmp_path_factory):
+    """Run every render against fake logs, never the operator's real setup.
+
+    AppTest runs streamlit_app.py in this process, so without this the pages
+    would read the real .env — and its network allowlist, service-account login
+    and log host — exactly as a live launch does. Environment variables beat
+    .env and secrets.toml, so setting them here pins the configuration.
+    """
+    import logseeker.config as config_mod
+    import logseeker.jobs as jobs_mod
+    import tools.make_demo as demo
+
+    root = tmp_path_factory.mktemp("render")
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(demo, "DEMO_LOGS", root / "logs")
+        demo.make_logs()
+        base = (root / "logs" / "apps" / "k" / "algologs" / "ap").as_posix()
+
+        mp.setattr(config_mod, "DOTENV_PATH", root / "no.env")
+        for key, value in {
+            "BACKEND": "local",
+            "LOG_DIR_TEMPLATE": f"{base}/{{instance}}/logs",
+            "LOG_GLOB_TEMPLATE": "APA*_pingOrderStream_{date}*.out",
+            "INSTANCES": ",".join(demo.INSTANCES),
+            "ALLOWED_NETWORKS": "",
+            "SHOW_ADMIN": "true",
+            "DATA_DIR": str(root / "data"),
+            "WORKERS": "2",
+            "SSH_HOST": "", "SSH_USER": "", "SSH_PASSWORD": "", "SSH_KEY_PATH": "",
+            "KDB_RDB": "", "KDB_HDB": "",
+        }.items():
+            mp.setenv(f"LOGSEEKER_{key}", value)
+
+        config_mod._dotenv.cache_clear()
+        config_mod.get_settings.cache_clear()
+        mp.setattr(jobs_mod, "_manager", None)
+        yield
+        config_mod._dotenv.cache_clear()
+        config_mod.get_settings.cache_clear()
+
+
 def _app(**session) -> AppTest:
     at = AppTest.from_file(str(ROOT / "streamlit_app.py"), default_timeout=30)
     for key, value in session.items():
@@ -190,6 +232,34 @@ def test_large_result_uses_the_two_step_download():
     labels = [d.label for d in at.get("download_button")]
     assert any(".gz" in l for l in labels), labels
     assert any("raw .txt" in l for l in labels), labels
+
+
+@pytest.mark.parametrize("status, expect", [
+    ("found", "trader: **jdoe**"),
+    ("not_found", "No target"),
+    ("error", "kdb lookup failed"),
+])
+def test_kdb_result_is_shown_on_the_card(status, expect):
+    from logseeker import kdb
+    from logseeker.jobs import Job, JobStatus, get_manager
+    from logseeker.search import SearchRequest
+
+    rows = [{"date": "2026-11-12", "trader": "jdoe"}] if status == "found" else []
+    message = {"found": "Found.", "not_found": "No target with that id.",
+               "error": "kdb lookup failed: refused"}[status]
+    job = Job(id=f"kdb{status}", status=JobStatus.FAILED, error="no logs",
+              request=SearchRequest(pattern="540000001", instances=["APIA"],
+                                    dates=["20261112"]),
+              kdb=kdb.KdbCheck(status, message, sources=[
+                  kdb.SourceResult("HDB", "h:1", rows=rows)]))
+    manager = get_manager()
+    with manager._lock:
+        manager._jobs[job.id] = job
+
+    at = _app(ls_my_jobs=[job.id]).run()
+    _no_exceptions(at)
+    shown = [e.value for e in (*at.success, *at.warning, *at.error)]
+    assert any(expect in v for v in shown), shown
 
 
 if __name__ == "__main__":

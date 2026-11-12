@@ -9,7 +9,7 @@ from datetime import date
 
 import streamlit as st
 
-from logseeker import access, store, ui
+from logseeker import access, kdb, store, ui
 from logseeker.config import get_settings
 from logseeker.jobs import JobStatus, get_manager
 from logseeker.search import (
@@ -144,6 +144,37 @@ if submitted:
 # Status cards for everything this session submitted
 # --------------------------------------------------------------------------- #
 
+def render_kdb(j) -> None:
+    """What kdb's `target` table said about this id. Never blocks the grep."""
+    check = j.kdb
+    if check is None:       # kdb not configured, or the check has not run yet
+        return
+
+    if check.status == kdb.FOUND:
+        traders = ", ".join(f"**{t}**" for t in check.traders) or "no trader recorded"
+        st.success(f"id_target exists in kdb — trader: {traders}",
+                   icon=":material/database:")
+        if len(check.rows) > 1 or any(r.get("date") for r in check.rows):
+            with st.expander(f"kdb rows ({len(check.rows)})", icon=":material/table:"):
+                st.dataframe(check.rows, hide_index=True, use_container_width=True)
+    elif check.status == kdb.NOT_FOUND:
+        st.warning(
+            f"{check.message} The log search still runs — but check the id and date.",
+            icon=":material/database:",
+        )
+    elif check.status == kdb.ERROR:
+        st.warning(f"{check.message} The log search is unaffected.",
+                   icon=":material/database:")
+    else:
+        st.caption(f":material/database: {check.message}")
+
+    if check.skipped_dates:
+        which = "today (no RDB configured)" if check.skipped_dates == [
+            date.today().strftime("%Y%m%d")] else (
+            f"{len(check.skipped_dates)} date(s) — no endpoint configured for them")
+        st.caption(f"Not checked in kdb: {which}.")
+
+
 def render_job(j, *, live: bool) -> None:
     """One job's status card. ``live`` says whether we are inside the ticking
     fragment, which decides how a Cancel click reruns."""
@@ -156,12 +187,16 @@ def render_job(j, *, live: bool) -> None:
         with head[1]:
             ui.status_badge(j)
 
+        render_kdb(j)
+
         if j.status is JobStatus.QUEUED:
             st.caption(
                 f"Waiting for a free worker "
                 f"({manager.settings.workers} run at a time) · "
                 f"{ui.human_duration(j.wait_time)}"
             )
+        elif j.status is JobStatus.CHECKING_KDB:
+            st.caption("Asking kdb whether this id_target exists…")
         elif j.status is JobStatus.LISTING:
             st.caption("Working out which log files exist for those dates…")
         elif j.status is JobStatus.SEARCHING:

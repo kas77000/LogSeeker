@@ -3,7 +3,7 @@
 import pandas as pd
 import streamlit as st
 
-from logseeker import audit, store, ui
+from logseeker import audit, kdb, store, ui
 from logseeker.config import config_problems, get_settings, source_of
 from logseeker.jobs import get_manager
 from logseeker.remote import RemoteError, get_backend
@@ -54,6 +54,44 @@ with tab_health:
                 st.error(str(exc), icon=":material/error:")
             except Exception as exc:  # noqa: BLE001
                 st.error(f"{type(exc).__name__}: {exc}", icon=":material/error:")
+
+    st.subheader("kdb")
+    if not settings.kdb_enabled:
+        st.caption("Not configured — set `LOGSEEKER_KDB_RDB` and/or `LOGSEEKER_KDB_HDB` "
+                   "to check each id_target against the `target` table.")
+    else:
+        st.caption(
+            f"RDB (today): `{settings.kdb_rdb or 'not set'}` · "
+            f"HDB (earlier dates): `{settings.kdb_hdb or 'not set'}` · "
+            f"user: `{settings.kdb_user or 'none'}`"
+        )
+        kcols = st.columns([1, 1, 1], vertical_alignment="bottom")
+        with kcols[0]:
+            k_id = st.text_input("id_target", placeholder="540000001", key="adm_kdb_id")
+        with kcols[1]:
+            k_date = st.date_input("Date", key="adm_kdb_date", format="YYYY-MM-DD")
+        with kcols[2]:
+            k_run = st.button("Look up", icon=":material/database:")
+        if st.button("Test kdb connection", icon=":material/network_check:"):
+            with st.spinner("Connecting to kdb…"):
+                try:
+                    for s in kdb.ping(settings):
+                        if s.error:
+                            st.error(f"{s.source} `{s.endpoint}` — {s.error}",
+                                     icon=":material/error:")
+                        else:
+                            st.success(f"{s.source} `{s.endpoint}` — {s.info}",
+                                       icon=":material/check_circle:")
+                except Exception as exc:  # noqa: BLE001
+                    st.error(f"{type(exc).__name__}: {exc}", icon=":material/error:")
+        if k_run:
+            with st.spinner("Querying `target`…"):
+                check = kdb.lookup_target(settings, k_id.strip(),
+                                          [k_date.strftime("%Y%m%d")])
+            {kdb.FOUND: st.success, kdb.NOT_FOUND: st.warning,
+             kdb.ERROR: st.error}.get(check.status, st.info)(check.message)
+            if check.rows:
+                st.dataframe(check.rows, hide_index=True, use_container_width=True)
 
     st.subheader("Log directory probe")
     st.caption("Lists the log files that exist for one instance and date, without grepping.")
@@ -170,6 +208,11 @@ with tab_config:
         "ssh_password": "••••" if settings.ssh_password else "",
         "ssh_known_hosts": settings.ssh_known_hosts,
         "ssh_auto_add_host_key": settings.ssh_auto_add_host_key,
+        "kdb_rdb": settings.kdb_rdb,
+        "kdb_hdb": settings.kdb_hdb,
+        "kdb_user": settings.kdb_user,
+        "kdb_password": "••••" if settings.kdb_password else "",
+        "kdb_timeout": settings.kdb_timeout,
         "log_dir_template": settings.log_dir_template,
         "log_glob_template": settings.log_glob_template,
         "instances": ", ".join(settings.instances),

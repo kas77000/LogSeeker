@@ -122,7 +122,7 @@ class Settings:
     # change, not a code change.
     log_dir_template: str = "/apps/k/algologs/ap/{instance}/logs"
     log_glob_template: str = "APA*_pingOrderStream_{date}*.out"
-    instances: list[str] = field(default_factory=lambda: ["APIA", "APIE"])
+    instances: list[str] = field(default_factory=lambda: ["APIA", "APIB", "APIC", "APID", "APIE", "APIF", "APIG", "APIH", "APII", "APIL", "APIM"])
 
     # --- how we reach it -----------------------------------------------------
     backend: str = "ssh"  # "ssh" | "local"
@@ -138,6 +138,15 @@ class Settings:
     ssh_known_hosts: str = ""
     ssh_auto_add_host_key: bool = False
     ssh_connect_timeout: int = 20
+
+    # --- kdb: does the id_target exist, and whose is it? --------------------
+    # "host:port". The RDB answers for today, the HDB for earlier dates. Either
+    # may be left blank; that half of the check is then skipped and said so.
+    kdb_rdb: str = ""
+    kdb_hdb: str = ""
+    kdb_user: str = ""
+    kdb_password: str = field(default="", repr=False)
+    kdb_timeout: int = 30
 
     # --- guard rails ---------------------------------------------------------
     command_timeout: int = 900          # seconds before we kill a search
@@ -212,6 +221,10 @@ class Settings:
             return "password"
         return "none configured"
 
+    @property
+    def kdb_enabled(self) -> bool:
+        return bool(self.kdb_rdb.strip() or self.kdb_hdb.strip())
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
@@ -219,7 +232,7 @@ def get_settings() -> Settings:
     settings = Settings(
         log_dir_template=_get("log_dir_template", "/apps/k/algologs/ap/{instance}/logs"),
         log_glob_template=_get("log_glob_template", "APA*_pingOrderStream_{date}*.out"),
-        instances=_get_list("instances", ["APIA", "APIE"]),
+        instances=_get_list("instances", ["APIA", "APIB", "APIC", "APID", "APIE", "APIF", "APIG", "APIH", "APII", "APIL", "APIM"]),
         backend=str(_get("backend", "ssh")).lower(),
         ssh_host=_get("ssh_host", ""),
         ssh_port=_get_int("ssh_port", 22),
@@ -230,6 +243,11 @@ def get_settings() -> Settings:
         ssh_known_hosts=_get("ssh_known_hosts", ""),
         ssh_auto_add_host_key=_get_bool("ssh_auto_add_host_key", False),
         ssh_connect_timeout=_get_int("ssh_connect_timeout", 20),
+        kdb_rdb=str(_get("kdb_rdb", "")),
+        kdb_hdb=str(_get("kdb_hdb", "")),
+        kdb_user=str(_get("kdb_user", "")),
+        kdb_password=str(_get("kdb_password", "")),
+        kdb_timeout=_get_int("kdb_timeout", 30),
         command_timeout=_get_int("command_timeout", 900),
         max_files_per_search=_get_int("max_files_per_search", 500),
         max_scan_bytes=_get_int("max_scan_bytes", 200 * 1024 * 1024 * 1024),
@@ -281,6 +299,18 @@ def config_problems(settings: Settings) -> list[str]:
                 "and ssh_known_hosts is unset, so the connection will be refused. "
                 "Run `ssh <user>@<host>` once and accept the fingerprint."
             )
+    if settings.kdb_enabled:
+        # Imported here: kdb imports search, which imports this module.
+        from .kdb import parse_endpoint, pykx_installed
+
+        for key in ("kdb_rdb", "kdb_hdb"):
+            try:
+                parse_endpoint(getattr(settings, key))
+            except ValueError as exc:
+                problems.append(f"{key}: {exc}")
+        if not pykx_installed():
+            problems.append("kdb is configured but pykx is not installed — "
+                            "run `pip install -r requirements.txt`")
     if not settings.instances:
         problems.append("no instances configured")
     if "{instance}" not in settings.log_dir_template:

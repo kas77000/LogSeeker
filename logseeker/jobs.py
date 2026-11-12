@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
-from . import audit, store
+from . import audit, kdb, store
 from .config import Settings, get_settings
 from .remote import CommandResult, RemoteError, get_backend
 from .search import (
@@ -40,6 +40,7 @@ from .search import (
 
 class JobStatus(str, Enum):
     QUEUED = "queued"
+    CHECKING_KDB = "checking_kdb"
     LISTING = "listing"
     SEARCHING = "searching"
     DONE = "done"
@@ -72,6 +73,7 @@ class Job:
     error: str = ""
     warnings: list[str] = field(default_factory=list)
     command: str = ""
+    kdb: "kdb.KdbCheck | None" = None   # None until the kdb check has run
 
     _cancel: threading.Event = field(default_factory=threading.Event, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
@@ -214,7 +216,22 @@ class JobManager:
 
     def _run(self, job: Job) -> None:
         settings = self.settings
-        self._set(job, started_at=time.time(), status=JobStatus.LISTING)
+        self._set(job, started_at=time.time())
+
+        # The cheap question first: does kdb know this id_target, and whose is
+        # it? Informational only — a kdb outage or a miss never stops the grep,
+        # because the logs are the authority this app exists to fetch.
+        if settings.kdb_enabled:
+            self._set(job, status=JobStatus.CHECKING_KDB)
+            check = kdb.lookup_target(settings, job.request.pattern, job.request.dates,
+                                      exact=job.request.match_mode == "fixed")
+            self._set(job, kdb=check)
+            audit.record(settings.audit_path, "kdb_checked",
+                         job_id=job.id, user=job.request.requested_by,
+                         pattern=job.request.pattern, status=check.status,
+                         traders=check.traders, message=check.message)
+
+        self._set(job, status=JobStatus.LISTING)
 
         try:
             cached = store.lookup(settings, job.request)
