@@ -289,5 +289,57 @@ def test_end_to_end_over_plain_and_gzipped_logs_with_real_names(settings, tmp_pa
         assert re.match(r".*pingOrderStream_[0-9]{8}\[[0-9-]+\]\.out(\.gz)?:", line), line
 
 
+# --------------------------------------------------------------------------- #
+# A grep that could not search must never read as "no match"
+# --------------------------------------------------------------------------- #
+
+def test_grep_status_is_read_back_from_stderr():
+    from logseeker.search import split_grep_status
+
+    codes, err = split_grep_status(
+        "LOGSEEKER_GREP_RC=2\ngrep: /x.out: Value too large for defined data type\n"
+        "LOGSEEKER_GREP_RC=1\n")
+    assert codes == [2, 1]
+    assert err == "grep: /x.out: Value too large for defined data type"
+
+
+def _run_job(settings):
+    job = JobManager(settings).submit(validate(req(), settings))
+    deadline = time.time() + 30
+    while not job.status.is_terminal and time.time() < deadline:
+        time.sleep(0.1)
+    return job
+
+
+@pytest.mark.skipif(shutil.which("grep") is None, reason="needs grep on PATH")
+def test_a_grep_that_cannot_read_its_file_fails_loudly(settings, monkeypatch):
+    """`grep | head` exits with head's 0, so this used to say "no line matched"."""
+    import logseeker.jobs as jobs_mod
+    from logseeker.search import LogFile
+
+    missing = (Path(settings.log_dir("APIA")) / "APA2_pingOrderStream_20260421[15-15-41].out")
+    monkeypatch.setattr(jobs_mod, "parse_file_list",
+                        lambda raw, s: ([LogFile(missing.as_posix(), 1024)], False))
+    job = _run_job(settings)
+    assert job.status is JobStatus.FAILED, (job.status, job.error)
+    assert "could not search" in job.error and "not a 'no match'" in job.error
+    assert "LOGSEEKER_GREP_RC" not in job.error
+
+
+@pytest.mark.skipif(shutil.which("grep") is None, reason="needs grep on PATH")
+def test_hitting_the_line_cap_is_not_mistaken_for_a_grep_failure(settings):
+    from dataclasses import replace
+
+    capped = replace(settings, max_result_lines=5)
+    log_dir = Path(capped.log_dir("APIA"))
+    log_dir.mkdir(parents=True, exist_ok=True)
+    (log_dir / "APA1_pingOrderStream_20260421_1.out").write_text(
+        "orderId=540000001 status=ACK\n" * 50000, encoding="utf-8")
+    job = _run_job(capped)
+    assert job.status is JobStatus.DONE, job.error
+    assert job.lines_written == 5
+    assert any("line cap" in w for w in job.warnings)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

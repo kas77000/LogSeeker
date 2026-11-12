@@ -246,22 +246,48 @@ def build_grep_command(
     plain = [f for f in files if not f.endswith(".gz")]
     packed = [f for f in files if f.endswith(".gz")]
 
+    # `| head` makes the pipeline's exit status head's, which is always 0, so a
+    # grep that could not read its file looked exactly like "no line matched".
+    # Each grep therefore reports its own status on stderr, which head never
+    # touches; split_grep_status() reads it back. No `pipefail` needed, which
+    # the older shells on these hosts may not have.
+    report = f'echo "{GREP_RC_MARKER}$?" >&2'
+
     parts = []
     if plain:
         # /dev/null as a trailing operand forces grep to prefix every match with
         # its filename even when only one log matched — `grep -H` is not
         # portable to the older greps on these hosts.
-        parts.append(f"{grep} {' '.join(shlex.quote(f) for f in plain)} /dev/null")
+        parts.append(f"{{ {grep} {' '.join(shlex.quote(f) for f in plain)} /dev/null; "
+                     f"{report}; }}")
     for f in packed:
         # Older logs are gzipped. Decompress on the host and grep the stream;
         # awk restores the "<file>:" prefix grep cannot add to a pipe, so every
         # result line looks the same whichever kind of file it came from.
         q = shlex.quote(f)
-        parts.append(f"gzip -dc {q} | {grep} | awk -v f={q} '{{print f \":\" $0}}'")
+        parts.append(f"gzip -dc {q} | {{ {grep}; {report}; }} "
+                     f"| awk -v f={q} '{{print f \":\" $0}}'")
 
     if len(parts) == 1:
         return f"{parts[0]} | head -n {budget}"
     return "{ " + "; ".join(parts) + "; } | head -n " + str(budget)
+
+
+GREP_RC_MARKER = "LOGSEEKER_GREP_RC="
+
+
+def split_grep_status(stderr: str) -> tuple[list[int], str]:
+    """(each grep's exit status, the host's real stderr with the markers removed)."""
+    codes, other = [], []
+    for line in (stderr or "").splitlines():
+        if line.startswith(GREP_RC_MARKER):
+            value = line[len(GREP_RC_MARKER):].strip()
+            if value.isdigit():
+                codes.append(int(value))
+                continue
+        if line.strip():
+            other.append(line.rstrip())
+    return codes, "\n".join(other)
 
 
 @dataclass

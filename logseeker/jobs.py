@@ -36,6 +36,7 @@ from .search import (
     build_list_command,
     ValidationError,
     parse_file_list,
+    split_grep_status,
     validate,
 )
 
@@ -403,11 +404,27 @@ class JobManager:
                             # search never made.
                             break
 
+                        # grep: 0 matched, 1 no match, 2+ could not search. When
+                        # the line cap is hit, head closes the pipe and grep dies
+                        # of SIGPIPE (128+), which is expected, not a failure.
+                        codes, host_err = split_grep_status(result.stderr)
+                        capped = written["lines"] >= settings.max_result_lines
+                        failed = [c for c in codes if c > 1 and not (capped and c >= 128)]
+                        if failed:
+                            raise RuntimeError(
+                                f"grep could not search the log on the log host "
+                                f"(exit {failed[0]})"
+                                + (f": {host_err}" if host_err else ".")
+                                + " Nothing was searched, so this is not a 'no match'."
+                            )
+                        if host_err and host_err not in job.warnings:
+                            job.warnings.append(f"The log host reported: {host_err}")
+
                         self._set(job, bytes_scanned=job.bytes_scanned
                                   + sum(f.size_bytes for f in batch))
 
                         if result.exit_status not in (0, 1, None):
-                            raise RuntimeError(result.stderr or
+                            raise RuntimeError(host_err or
                                                f"grep exited {result.exit_status}")
 
             if result is None:

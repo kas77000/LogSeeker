@@ -217,7 +217,7 @@ def test_timeout_keeps_partial_results_and_says_how_far_it_got(settings, monkeyp
             with real.session() as inner:
                 class Session:
                     def run(_self, command, **kw):
-                        if command.lstrip().startswith("grep"):
+                        if not command.lstrip().startswith("du "):   # a grep batch
                             state["greps"] += 1
                             if state["greps"] > 1:
                                 return CommandResult(
