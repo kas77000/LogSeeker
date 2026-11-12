@@ -22,14 +22,38 @@ import streamlit as st
 from .config import Settings
 
 
+def _connection_ip() -> str:
+    """The address of the socket the browser connected from.
+
+    st.context.ip_address deliberately returns None for 127.0.0.1 and ::1
+    (streamlit/runtime/context.py), which is indistinguishable from "unknown"
+    and made the fail-closed check below lock the operator out of his own
+    machine. The connection's address is still known underneath; read it there.
+    It comes from the TCP peer, not a header, so a remote client cannot claim
+    to be localhost.
+    """
+    try:
+        from streamlit.runtime.context import _get_client_context
+
+        cc = _get_client_context()
+        return (getattr(cc, "remote_ip", None) or "") if cc is not None else ""
+    except Exception:
+        return ""
+
+
 def client_ip() -> str:
     """Best-effort client address. Empty string when Streamlit cannot tell us."""
     try:
         ctx = getattr(st, "context", None)
         ip = getattr(ctx, "ip_address", None) if ctx is not None else None
-        return ip or ""
     except Exception:
-        return ""
+        ip = None
+    return ip or _connection_ip()
+
+
+def _is_loopback(addr) -> bool:
+    mapped = getattr(addr, "ipv4_mapped", None)     # ::ffff:127.0.0.1
+    return addr.is_loopback or bool(mapped and mapped.is_loopback)
 
 
 def network_allowed(settings: Settings) -> tuple[bool, str]:
@@ -50,6 +74,12 @@ def network_allowed(settings: Settings) -> tuple[bool, str]:
         addr = ipaddress.ip_address(ip)
     except ValueError:
         return False, f"Client address {ip!r} is not a valid IP."
+
+    # The browser on the operator's own machine. Anyone there can already read
+    # .env, so refusing them protects nothing. Behind a reverse proxy on this
+    # same machine every visitor looks like loopback; set allow_localhost=false.
+    if settings.allow_localhost and _is_loopback(addr):
+        return True, ""
 
     for cidr in settings.allowed_networks:
         try:

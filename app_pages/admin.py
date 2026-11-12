@@ -227,6 +227,7 @@ with tab_config:
         "cache_ttl_hours": settings.cache_ttl_hours,
         "data_dir": str(settings.data_dir),
         "allowed_networks": ", ".join(settings.allowed_networks) or "(anyone can reach this app)",
+        "allow_localhost": settings.allow_localhost,
         "show_admin": settings.show_admin,
     }
     st.dataframe(

@@ -319,7 +319,10 @@ LOGSEEKER_ALLOWED_NETWORKS=10.0.0.0/8,192.168.0.0/16
 
 Requests from anywhere else get a refusal page. The check **fails closed**: if
 the list is set and the client address cannot be determined, access is denied
-rather than allowed. Until you set this, the app shows a standing warning on
+rather than allowed. Your own browser on the host machine (`localhost`) is always
+let in. If you put nginx or Caddy in front of the app *on the same machine*, set
+`LOGSEEKER_ALLOW_LOCALHOST=false`, because every visitor would then look like
+localhost. Until you set this, the app shows a standing warning on
 every page — that warning is accurate, not decoration.
 
 **Second, open the port** (once, as Administrator):
@@ -575,6 +578,7 @@ Reach for these in order — the first is usually enough:
 | **"No log files exist for that instance/date"** | Non-trading day, wrong instance, or a wrong path template. Use **Admin → Log directory probe** to see what is really there. |
 | **Searches return nothing but the probe finds files** | The order id is not in those logs, or you are on the wrong instance. Try regex mode with a fragment of the id. |
 | **App searches fake data** | A leftover `.streamlit\secrets.toml` from the demo. Delete it. Check **Admin → Configuration → source**. |
+| **"Access denied" on your own machine** | Fixed: `localhost` is always allowed now. If you still see it, check `LOGSEEKER_ALLOW_LOCALHOST` is not `false`. |
 | **Colleagues get "Access denied"** | Their IP is outside `LOGSEEKER_ALLOWED_NETWORKS`. Add their range. |
 | **Colleagues cannot reach it at all** | Firewall rule missing (step 7), or started without `run.ps1` so it bound to localhost. |
 | **"Search hit the time limit"** | Expected on very wide ranges — partial results are kept and the warning says how far it got. Narrow the range, or raise `LOGSEEKER_COMMAND_TIMEOUT`. |
@@ -614,6 +618,7 @@ setting.
 | `LOG_GLOB_TEMPLATE` | `APA*_pingOrderStream_{date}*.out` | Which files to scan |
 | `INSTANCES` | `APIA,APIB,APIC,APID,APIE,APIF,APIG,APIH,APII,APIL,APIM` | Allowlist; nothing outside it can be searched |
 | `ALLOWED_NETWORKS` | *(empty)* | CIDR allowlist. The app's only access control. |
+| `ALLOW_LOCALHOST` | `true` | Always admit the host machine's own browser. `false` behind a same-machine reverse proxy. |
 | `SHOW_ADMIN` | `true` | `false` hides the Admin page |
 | `WORKERS` | `3` | Concurrent greps against the log host |
 | `COMMAND_TIMEOUT` | `900` | Seconds before a search is killed |

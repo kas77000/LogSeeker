@@ -66,6 +66,41 @@ def test_a_valid_cidr_still_works_alongside_a_broken_one(monkeypatch):
     assert network_allowed(_settings(allowed_networks=["oops", "10.0.0.0/8"]))[0]
 
 
+@pytest.mark.parametrize("ip", ["127.0.0.1", "::1", "::ffff:127.0.0.1"])
+def test_the_operators_own_browser_is_let_in(monkeypatch, ip):
+    import logseeker.access as access
+
+    monkeypatch.setattr(access, "client_ip", lambda: ip)
+    office_only = _settings(allowed_networks=["10.0.0.0/8"])
+    assert network_allowed(office_only)[0]
+
+    allowed, reason = network_allowed(_settings(allowed_networks=["10.0.0.0/8"],
+                                                allow_localhost=False))
+    assert not allowed and "not in any allowed network" in reason
+
+
+def test_localhost_is_recovered_when_streamlit_hides_it(monkeypatch):
+    """st.context.ip_address is None for 127.0.0.1 - which used to lock the
+    operator out. The connection's own address is read instead."""
+    import types
+
+    import streamlit as st
+    import streamlit.runtime.context as st_context
+
+    import logseeker.access as access
+
+    monkeypatch.setattr(st, "context", types.SimpleNamespace(ip_address=None))
+    monkeypatch.setattr(st_context, "_get_client_context",
+                        lambda: types.SimpleNamespace(remote_ip="127.0.0.1"))
+    assert access.client_ip() == "127.0.0.1"
+    assert network_allowed(_settings(allowed_networks=["10.0.0.0/8"]))[0]
+
+    # ...but a client nobody can identify is still refused.
+    monkeypatch.setattr(st_context, "_get_client_context", lambda: None)
+    allowed, reason = network_allowed(_settings(allowed_networks=["10.0.0.0/8"]))
+    assert not allowed and "could not be determined" in reason
+
+
 # --------------------------------------------------------------------------- #
 # Config resolution: environment > .env > secrets.toml > default
 # --------------------------------------------------------------------------- #

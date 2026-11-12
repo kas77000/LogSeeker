@@ -179,6 +179,9 @@ class Settings:
     # There is no sign-in. Everyone who can open the URL searches as `ssh_user`.
     # The only access control is therefore at the network layer.
     allowed_networks: list[str] = field(default_factory=list)  # CIDRs; empty = anyone
+    # The operator's own browser (127.0.0.1 / ::1) is always let in. Turn off
+    # only when a reverse proxy on this machine makes every visitor loopback.
+    allow_localhost: bool = True
     show_admin: bool = True
 
     @property
@@ -262,6 +265,7 @@ def get_settings() -> Settings:
         max_disk_bytes=_get_int("max_disk_bytes", 5 * 1024 * 1024 * 1024),
         inline_download_bytes=_get_int("inline_download_bytes", 2 * 1024 * 1024),
         allowed_networks=_get_list("allowed_networks", []),
+        allow_localhost=_get_bool("allow_localhost", True),
         show_admin=_get_bool("show_admin", True),
     )
     settings.results_dir.mkdir(parents=True, exist_ok=True)
