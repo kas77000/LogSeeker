@@ -22,7 +22,7 @@ import time
 import uuid
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 
@@ -34,7 +34,9 @@ from .search import (
     batch_files,
     build_grep_command,
     build_list_command,
+    ValidationError,
     parse_file_list,
+    validate,
 )
 
 
@@ -74,6 +76,7 @@ class Job:
     warnings: list[str] = field(default_factory=list)
     command: str = ""
     kdb: "kdb.KdbCheck | None" = None   # None until the kdb check has run
+    auto_instances: bool = False        # instances were taken from kdb's trader
 
     _cancel: threading.Event = field(default_factory=threading.Event, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
@@ -214,6 +217,26 @@ class JobManager:
             for key, value in fields.items():
                 setattr(job, key, value)
 
+    def _resolve_instances(self, job: Job) -> bool:
+        """Fill in an "automatic" request's instances from kdb. False = job failed."""
+        settings = self.settings
+        instances, warnings, error = resolve_instances(job.kdb, settings)
+        job.warnings.extend(warnings)
+        if not error:
+            try:
+                resolved = validate(replace(job.request, instances=instances), settings)
+            except ValidationError as exc:
+                error = str(exc)
+        if error:
+            self._set(job, status=JobStatus.FAILED, finished_at=time.time(), error=error)
+            audit.record(settings.audit_path, "search_failed", job_id=job.id,
+                         user=job.request.requested_by, error=error, kind="instance")
+            return False
+        self._set(job, request=resolved, auto_instances=True)
+        audit.record(settings.audit_path, "instances_from_kdb", job_id=job.id,
+                     user=job.request.requested_by, instances=instances)
+        return True
+
     def _run(self, job: Job) -> None:
         settings = self.settings
         self._set(job, started_at=time.time())
@@ -230,6 +253,10 @@ class JobManager:
                          job_id=job.id, user=job.request.requested_by,
                          pattern=job.request.pattern, status=check.status,
                          traders=check.traders, message=check.message)
+
+        if not job.request.instances:
+            if not self._resolve_instances(job):
+                return
 
         self._set(job, status=JobStatus.LISTING)
 
@@ -466,6 +493,48 @@ class JobManager:
             audit.record(settings.audit_path, "search_failed", job_id=job.id,
                          user=job.request.requested_by, error=str(exc),
                          kind=type(exc).__name__)
+
+
+def resolve_instances(check: "kdb.KdbCheck | None", settings: Settings
+                      ) -> tuple[list[str], list[str], str]:
+    """Instances to search, from kdb's `target`.trader — which names the folder.
+
+    Returns (instances, warnings, error). Matching is case-insensitive, and only
+    configured instances can come out: a trader value is data from kdb, and the
+    allowlist is what stops it pointing the glob at an arbitrary directory.
+    """
+    if check is None or check.status != kdb.FOUND:
+        reason = check.message if check is not None else "kdb is not configured."
+        return [], [], (f"Could not work out the instance from kdb — {reason} "
+                        "Pick an instance and search again.")
+
+    configured = {i.upper(): i for i in settings.instances}
+    instances, unknown = [], []
+    for trader in check.traders:
+        inst = configured.get(trader.strip().upper())
+        if inst is None:
+            unknown.append(trader)
+        elif inst not in instances:
+            instances.append(inst)
+
+    warnings = []
+    if unknown:
+        warnings.append(
+            f"kdb lists trader(s) {', '.join(unknown)} for this id, which are not "
+            "configured instances, so they were not searched."
+        )
+    if check.skipped_dates:
+        warnings.append(
+            f"kdb was not asked about {', '.join(check.skipped_dates)}; the instance "
+            "comes from the other dates."
+        )
+    if not instances:
+        return [], warnings, (
+            f"kdb says this id belongs to {', '.join(check.traders)}, which is not one "
+            f"of the configured instances ({', '.join(settings.instances)}). "
+            "Pick an instance, or add it to LOGSEEKER_INSTANCES."
+        )
+    return instances, warnings, ""
 
 
 class _Cancelled(Exception):

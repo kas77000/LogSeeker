@@ -53,7 +53,7 @@ def job_table():
             with row[0]:
                 st.markdown(f"**{job.request.pattern}**")
                 st.caption(
-                    f"{'+'.join(job.request.instances)} · "
+                    f"{'+'.join(job.request.instances) or 'auto'} · "
                     f"{job.request.dates[0]}"
                     + (f"–{job.request.dates[-1]}" if len(job.request.dates) > 1 else "")
                     + f" · requested by {job.request.requested_by} · "

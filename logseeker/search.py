@@ -24,6 +24,15 @@ ORDER_ID_RE = re.compile(r"^[A-Za-z0-9._:\-]{1,64}$")
 INSTANCE_RE = re.compile(r"^[A-Za-z0-9_\-]{1,32}$")
 DATE_RE = re.compile(r"^\d{8}$")
 
+# kdb's `target`.id_target is type "i", a 32-bit int.
+KDB_ID_MAX = 2**31 - 1
+
+
+def kdb_id_ok(pattern: str) -> bool:
+    """Could this be an id_target in kdb? Digits only, within a q int."""
+    return pattern.isdigit() and int(pattern) <= KDB_ID_MAX
+
+
 MATCH_FIXED = "fixed"
 MATCH_REGEX = "regex"
 
@@ -39,7 +48,6 @@ class SearchRequest:
     dates: list[str]                      # YYYYMMDD
     match_mode: str = MATCH_FIXED
     ignore_case: bool = False
-    context_lines: int = 0
     requested_by: str = "unknown"
     note: str = ""
 
@@ -54,12 +62,11 @@ class SearchRequest:
             ",".join(sorted(self.dates)),
             self.match_mode,
             str(self.ignore_case),
-            str(self.context_lines),
         ])
         return hashlib.sha256(parts.encode("utf-8")).hexdigest()[:20]
 
     def label(self) -> str:
-        insts = "+".join(sorted(self.instances))
+        insts = "+".join(sorted(self.instances)) or "auto"
         if len(self.dates) == 1:
             span = self.dates[0]
         else:
@@ -105,7 +112,20 @@ def validate(req: SearchRequest, settings: Settings) -> SearchRequest:
 
     instances = [i.strip() for i in req.instances if i.strip()]
     if not instances:
-        raise ValidationError("Select at least one instance.")
+        # No instance picked: the job will take it from kdb's `target`.trader,
+        # which names the log folder. That needs kdb and an id kdb can hold.
+        if not settings.kdb_enabled:
+            raise ValidationError("Select at least one instance.")
+        if req.match_mode != MATCH_FIXED:
+            raise ValidationError(
+                "Pick an instance for a pattern search — the instance can only be "
+                "worked out from kdb for an exact order id."
+            )
+        if not kdb_id_ok(pattern):
+            raise ValidationError(
+                f"`{pattern}` cannot be a kdb id_target (a whole number up to "
+                f"{KDB_ID_MAX:,}), so the instance cannot be looked up. Pick one."
+            )
     for inst in instances:
         if not INSTANCE_RE.match(inst):
             raise ValidationError(f"Invalid instance name: {inst!r}")
@@ -126,16 +146,12 @@ def validate(req: SearchRequest, settings: Settings) -> SearchRequest:
             "Narrow the range — a wide scan ties up the log host for everyone."
         )
 
-    if not 0 <= req.context_lines <= 20:
-        raise ValidationError("Context lines must be between 0 and 20.")
-
     return SearchRequest(
         pattern=pattern,
         instances=instances,
         dates=dates,
         match_mode=req.match_mode,
         ignore_case=req.ignore_case,
-        context_lines=req.context_lines,
         requested_by=req.requested_by,
         note=req.note.strip()[:200],
     )
@@ -217,8 +233,6 @@ def build_grep_command(
     flags = ["-F"] if req.match_mode == MATCH_FIXED else ["-E"]
     if req.ignore_case:
         flags.append("-i")
-    if req.context_lines:
-        flags.append(f"-C {req.context_lines}")
 
     quoted = " ".join(shlex.quote(f) for f in files)
     budget = settings.max_result_lines if line_budget is None else line_budget

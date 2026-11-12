@@ -57,10 +57,17 @@ with st.form("search_form", border=True, width=FORM_WIDTH):
         help="Searched as literal text. Use Advanced → Search type for pattern matching.",
     )
 
+    # With kdb configured the instance can be left empty: kdb's `target`.trader
+    # names the log folder, so the job looks it up before grepping.
+    auto_ok = settings.kdb_enabled
     instances = st.multiselect(
         "Instance",
         options=settings.instances,
-        default=settings.instances[:1],
+        default=[] if auto_ok else settings.instances[:1],
+        placeholder="Automatic — from the kdb trader" if auto_ok else "Choose an instance",
+        help=("Leave empty and LogSeeker asks kdb which instance handled this order "
+              "(the `trader` column), then searches only that one. Pick one or more "
+              "to override.") if auto_ok else None,
     )
 
     today = date.today()
@@ -95,12 +102,6 @@ with st.form("search_form", border=True, width=FORM_WIDTH):
             ),
         )
         ignore_case = st.toggle("Ignore upper/lower case", value=False)
-        context_lines = st.number_input(
-            "Lines of context around each match", min_value=0, max_value=20,
-            value=0, step=1,
-            help="Include surrounding lines, like `grep -C`. Useful for seeing what "
-                 "happened either side of an event.",
-        )
         if date_mode == "Date range":
             skip_weekends = st.toggle(
                 "Skip weekends", value=True,
@@ -118,7 +119,6 @@ if submitted:
         dates=date_range(start, end, weekdays_only=skip_weekends),
         match_mode=MATCH_REGEX if search_type == "Pattern (regex)" else MATCH_FIXED,
         ignore_case=ignore_case,
-        context_lines=int(context_lines),
         requested_by=user,
         note=note,
     )
@@ -127,7 +127,9 @@ if submitted:
     except ValidationError as exc:
         st.error(str(exc), icon=":material/error:")
     else:
-        cached = store.lookup(settings, request)
+        # An automatic request has no instances yet, so it cannot be a cache hit
+        # until the job has asked kdb; the toast is for explicit requests only.
+        cached = store.lookup(settings, request) if request.instances else None
         job = manager.submit(request)
 
         # Track every job this session started, newest first, rather than a
@@ -188,6 +190,9 @@ def render_job(j, *, live: bool) -> None:
             ui.status_badge(j)
 
         render_kdb(j)
+        if j.auto_instances:
+            st.caption(f":material/auto_awesome: Instance from kdb: "
+                       f"**{', '.join(j.request.instances)}**")
 
         if j.status is JobStatus.QUEUED:
             st.caption(

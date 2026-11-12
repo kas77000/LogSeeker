@@ -378,7 +378,7 @@ from **Admin → Storage**.
 | Field | What it does |
 |---|---|
 | **Order id** | What to look for. Searched as literal text by default. |
-| **Instance** | Which system's logs. Pick more than one to search both at once. |
+| **Instance** | Which system's logs. **Leave it empty** (with kdb configured) and the app asks kdb which instance handled the order, then searches only that one. Pick one or more to override. |
 | **Dates** | **Single date** by default, since that is almost always what you want. Switch to **Date range** above the form when you need several days. |
 | **Reason** | Optional. Goes in the audit log next to your search. |
 
@@ -405,10 +405,8 @@ and `|` means "or", so a search containing those characters will not do what you
 expect unless you meant them as operators. If you are pasting an order id,
 leave it on **Exact text**.
 
-The other two Advanced options are ordinary grep behaviour: **Ignore
-upper/lower case** (`grep -i`), and **Lines of context** (`grep -C`), which
-includes the surrounding lines so you can see what happened either side of a
-match.
+The other Advanced option is ordinary grep behaviour: **Ignore upper/lower
+case** (`grep -i`).
 
 ## Checking the id in kdb
 
@@ -420,10 +418,17 @@ search first asks the OMS `target` table whether the id exists and whose it is:
 | today | RDB | `select trader from target where id_target=<id>` |
 | any earlier date | HDB | `select date, trader from target where date in <dates>, id_target=<id>` |
 
+**The `trader` column names the log folder** (`APIA`, `APIE`, …). Leave
+**Instance** empty and the app uses it: kdb first, then a grep of that instance
+only. The trader must be one of `LOGSEEKER_INSTANCES` (any case). A value from kdb
+cannot point the search anywhere else. If kdb has no answer (id not found, kdb
+down, or a pattern search), an automatic search stops before grepping and asks you
+to pick the instance.
+
 The card then says **"id_target exists in kdb — trader: …"**, or warns that kdb
 has no such target for those dates, which usually means a mistyped id or the
-wrong date. **The log search runs either way.** kdb being down or missing an id
-never blocks fetching the logs.
+wrong date. When you picked the instance yourself, **the log search runs either way**: kdb
+being down or missing an id never blocks fetching the logs.
 
 `id_target` is a 32-bit int in kdb (`meta target` shows type `i`), so the id is
 sent as an int. An id that is not all digits, or is over 2,147,483,647, cannot
@@ -650,7 +655,7 @@ the working copy. Source comments that point at `../legacy/` refer to it.
 | No match ⇒ deletes output, exits 5, WinSCP's `get` fails, operator sees `ERROR: WinSCP failed` | "No line matched" is its own reported outcome | "Nothing found" and "the transfer broke" are different answers to a client query. |
 | Output is `<ORDER_ID>.txt` in one shared directory | `<id>_<instances>_<dates>_<hash>.txt` | Two people searching the same order for different dates silently overwrote each other. |
 | Order id goes from a `.bat` variable straight into `ksh -c "…"` | Allowlist validation + `shlex.quote` everywhere | Fine for a trusted operator at a keyboard. **Remote code execution** once a web form drives it. |
-| One order id, one instance, one date | Multiple instances, date ranges, exact or regex, context lines | The follow-up question was always "and the day before?". |
+| One order id, one instance, one date | Multiple instances, date ranges, exact or regex | The follow-up question was always "and the day before?". |
 | Blocks the operator's terminal for minutes | Bounded worker pool, live progress, cancellable | Ten simultaneous requests must not become ten greps on a production host. |
 | No record of who pulled what | Append-only JSONL audit log | Production order logs on a shared app. |
 | Identical request re-greps from scratch | Result cache keyed on the search itself | Two people asking the same question share one grep. |
@@ -722,7 +727,7 @@ finishes**, so a completed 60 MB result is not re-rendered every second.
 python -m pytest tests -q
 ```
 
-93 tests covering: input validation including a dozen shell-injection attempts;
+104 tests covering: input validation including a dozen shell-injection attempts;
 command construction and glob quoting; request identity and filename collisions;
 the CIDR allowlist and its fail-closed behaviour; config resolution order; the
 line, byte and disk caps *and their warnings*; gzip reuse; cache-hit metadata;

@@ -244,3 +244,82 @@ def test_kdb_result_rides_on_the_job_and_the_grep_still_runs(settings, monkeypat
     assert job.kdb.status == kdb.NOT_FOUND
     assert job.status is JobStatus.DONE, job.error      # a kdb miss does not stop the grep
     assert job.lines_written == 1
+
+
+# --------------------------------------------------------------------------- #
+# Automatic instance: kdb's trader names the log folder
+# --------------------------------------------------------------------------- #
+
+from logseeker.jobs import resolve_instances          # noqa: E402
+from logseeker.search import MATCH_REGEX, ValidationError  # noqa: E402
+
+
+def _found(*traders):
+    return kdb.KdbCheck(kdb.FOUND, "Found.", sources=[kdb.SourceResult(
+        "HDB", "h:1", rows=[{"date": "2026-04-21", "trader": t} for t in traders])])
+
+
+def test_an_empty_instance_is_allowed_only_when_kdb_can_fill_it(settings):
+    auto = SearchRequest(pattern="540000001", instances=[], dates=["20260421"])
+    assert validate(auto, settings).instances == []
+
+    with pytest.raises(ValidationError, match="Select at least one instance"):
+        validate(auto, replace(settings, kdb_rdb="", kdb_hdb=""))
+    with pytest.raises(ValidationError, match="pattern search"):
+        validate(replace(auto, match_mode=MATCH_REGEX), settings)
+    with pytest.raises(ValidationError, match="cannot be a kdb id_target"):
+        validate(replace(auto, pattern="ORD-1"), settings)
+
+
+def test_trader_maps_to_a_configured_instance_case_insensitively(settings):
+    s = replace(settings, instances=["APIA", "APIE"])
+    instances, warnings, error = resolve_instances(_found("apia", "APIA", "APIE"), s)
+    assert (instances, warnings, error) == (["APIA", "APIE"], [], "")
+
+
+def test_a_trader_outside_the_allowlist_is_never_searched(settings):
+    """kdb data must not be able to aim the glob at an arbitrary directory."""
+    s = replace(settings, instances=["APIA"])
+    instances, warnings, _ = resolve_instances(_found("APIA", "../../etc"), s)
+    assert instances == ["APIA"]
+    assert "../../etc" in warnings[0]
+
+    instances, _, error = resolve_instances(_found("APIZ"), s)
+    assert instances == [] and "APIZ" in error and "LOGSEEKER_INSTANCES" in error
+
+
+def test_no_kdb_answer_means_no_instance(settings):
+    for check in (None, kdb.KdbCheck(kdb.NOT_FOUND, "No target."),
+                  kdb.KdbCheck(kdb.ERROR, "kdb lookup failed: refused")):
+        instances, _, error = resolve_instances(check, settings)
+        assert instances == [] and "Pick an instance" in error
+
+
+def _run_auto(settings, monkeypatch, check):
+    log_dir = Path(settings.log_dir("APIA"))
+    log_dir.mkdir(parents=True, exist_ok=True)
+    (log_dir / "APA1_pingOrderStream_20260421_1.out").write_text(
+        "orderId=540000001 status=ACK\n", encoding="utf-8")
+    monkeypatch.setattr(kdb, "lookup_target", lambda *a, **k: check)
+    job = JobManager(settings).submit(validate(
+        SearchRequest(pattern="540000001", instances=[], dates=["20260421"]), settings))
+    deadline = time.time() + 30
+    while not job.status.is_terminal and time.time() < deadline:
+        time.sleep(0.1)
+    return job
+
+
+@pytest.mark.skipif(shutil.which("grep") is None, reason="needs grep on PATH")
+def test_automatic_search_greps_the_traders_folder(settings, monkeypatch):
+    job = _run_auto(settings, monkeypatch, _found("apia"))
+    assert job.status is JobStatus.DONE, job.error
+    assert job.auto_instances and job.request.instances == ["APIA"]
+    assert job.lines_written == 1
+    assert "APIA" in job.result_path.name
+
+
+def test_automatic_search_stops_before_grepping_when_kdb_has_no_answer(settings, monkeypatch):
+    job = _run_auto(settings, monkeypatch, kdb.KdbCheck(kdb.NOT_FOUND, "No target."))
+    assert job.status is JobStatus.FAILED
+    assert "Pick an instance" in job.error
+    assert job.files_found == 0 and job.result_path is None

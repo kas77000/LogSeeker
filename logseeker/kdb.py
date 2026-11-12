@@ -32,7 +32,7 @@ from datetime import date as date_cls, datetime
 from pathlib import Path
 
 from .config import Settings
-from .search import ORDER_ID_RE
+from .search import KDB_ID_MAX, ORDER_ID_RE, kdb_id_ok
 
 WORKER = Path(__file__).resolve().parent / "kdbworker" / "lookup.py"
 
@@ -42,8 +42,6 @@ STARTUP_ALLOWANCE_S = 60
 
 MAX_ROWS = 100
 
-# `meta target` shows id_target as type "i": a 32-bit int.
-INT_MAX = 2**31 - 1
 
 FOUND = "found"
 NOT_FOUND = "not_found"
@@ -153,9 +151,9 @@ def lookup_target(settings: Settings, id_target: str, dates: list[str], *,
         return KdbCheck(SKIPPED, "Pattern searches are not looked up in kdb — only an exact id is.")
     # Without this, "I"$ on the server would turn the id into a null and the
     # card would say "not found" — true, but it hides why.
-    if not id_target.isdigit() or int(id_target) > INT_MAX:
+    if not kdb_id_ok(id_target):
         return KdbCheck(SKIPPED, f"`{id_target}` cannot be a kdb id_target "
-                                 "(a whole number up to 2,147,483,647), so it was not looked up.")
+                                 f"(a whole number up to {KDB_ID_MAX:,}), so it was not looked up.")
     if not pykx_installed():
         return KdbCheck(ERROR, "pykx is not installed — run `pip install -r requirements.txt`.")
 
