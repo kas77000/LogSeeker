@@ -213,7 +213,14 @@ def build_list_command(req: SearchRequest, settings: Settings) -> str:
     for inst in req.instances:
         directory = settings.log_dir(inst)
         for d in req.dates:
-            globs.append(quote_glob(f"{directory}/{settings.log_glob(inst, d)}"))
+            # The filename carries the session's start date, not the trading
+            # date the user picked — see Settings.log_date_offset_days.
+            pattern = f"{directory}/{settings.log_glob(inst, settings.file_date(d))}"
+            globs.append(quote_glob(pattern))
+            # After about a week the host gzips each log in place (.out ->
+            # .out.gz). Look for both, so older dates are still found.
+            if not pattern.endswith(".gz"):
+                globs.append(quote_glob(pattern + ".gz"))
     return "du -k " + " ".join(globs) + " 2>/dev/null || true"
 
 
@@ -233,16 +240,28 @@ def build_grep_command(
     flags = ["-F"] if req.match_mode == MATCH_FIXED else ["-E"]
     if req.ignore_case:
         flags.append("-i")
+    grep = f"grep {' '.join(flags)} -- {shlex.quote(req.pattern)}"
+    budget = int(max(1, settings.max_result_lines if line_budget is None else line_budget))
 
-    quoted = " ".join(shlex.quote(f) for f in files)
-    budget = settings.max_result_lines if line_budget is None else line_budget
-    # /dev/null as a trailing operand forces grep to prefix every match with its
-    # filename even when only one log matched — `grep -H` is not portable to the
-    # older greps on these hosts.
-    return (
-        f"grep {' '.join(flags)} -- {shlex.quote(req.pattern)} {quoted} /dev/null "
-        f"| head -n {int(max(1, budget))}"
-    )
+    plain = [f for f in files if not f.endswith(".gz")]
+    packed = [f for f in files if f.endswith(".gz")]
+
+    parts = []
+    if plain:
+        # /dev/null as a trailing operand forces grep to prefix every match with
+        # its filename even when only one log matched — `grep -H` is not
+        # portable to the older greps on these hosts.
+        parts.append(f"{grep} {' '.join(shlex.quote(f) for f in plain)} /dev/null")
+    for f in packed:
+        # Older logs are gzipped. Decompress on the host and grep the stream;
+        # awk restores the "<file>:" prefix grep cannot add to a pipe, so every
+        # result line looks the same whichever kind of file it came from.
+        q = shlex.quote(f)
+        parts.append(f"gzip -dc {q} | {grep} | awk -v f={q} '{{print f \":\" $0}}'")
+
+    if len(parts) == 1:
+        return f"{parts[0]} | head -n {budget}"
+    return "{ " + "; ".join(parts) + "; } | head -n " + str(budget)
 
 
 @dataclass

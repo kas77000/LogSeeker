@@ -490,6 +490,20 @@ Nothing ever holds a whole log, or a whole result, in memory:
   cache hit never re-reads the payload.
 - gzip is produced by streaming 1 MB blocks and is built once, then reused.
 
+## Dates and file names
+
+**Pick the trading date, as you would anywhere else.** The log *filename* carries
+the date the US side started the session, the afternoon before Asia trades, so
+Monday's orders are in the file named for Sunday and Friday's in Thursday's.
+`LOGSEEKER_LOG_DATE_OFFSET_DAYS=-1` makes the app do that conversion. kdb and
+everything on screen keep using the real trading date.
+
+After about a week the host **gzips each log** (`.out` → `.out.gz`). The app
+looks for both and decompresses on the log host while searching, so older dates
+work. Logs older than about two weeks are deleted from the host, and no tool can
+search those. For compressed files the size shown and the progress bar reflect
+the compressed size, so a compressed day reads as smaller than it really is.
+
 ## Knowing what you are about to scan
 
 The file listing uses `du -k`, so before any reading starts the app knows how
@@ -620,7 +634,8 @@ setting.
 | `KDB_USER` / `KDB_PASSWORD` | *(empty)* | Only if the kdb processes require a login |
 | `KDB_TIMEOUT` | `30` | Seconds per kdb query |
 | `LOG_DIR_TEMPLATE` | `/apps/k/algologs/ap/{instance}/logs` | Where logs live |
-| `LOG_GLOB_TEMPLATE` | `APA*_pingOrderStream_{date}*.out` | Which files to scan |
+| `LOG_GLOB_TEMPLATE` | `APA*_pingOrderStream_{date}*.out` | Which files to scan; `.out.gz` is matched too |
+| `LOG_DATE_OFFSET_DAYS` | `0` (`-1` in `.env`) | Days from trading date to the filename's date. `-1`: Monday's orders are in Sunday's file |
 | `INSTANCES` | `APIA,APIB,APIC,APID,APIE,APIF,APIG,APIH,APII,APIL,APIM` | Allowlist; nothing outside it can be searched |
 | `ALLOWED_NETWORKS` | *(empty)* | CIDR allowlist. The app's only access control. |
 | `ALLOW_LOCALHOST` | `true` | Always admit the host machine's own browser. `false` behind a same-machine reverse proxy. |
@@ -727,7 +742,7 @@ finishes**, so a completed 60 MB result is not re-rendered every second.
 python -m pytest tests -q
 ```
 
-104 tests covering: input validation including a dozen shell-injection attempts;
+106 tests covering: input validation including a dozen shell-injection attempts;
 command construction and glob quoting; request identity and filename collisions;
 the CIDR allowlist and its fail-closed behaviour; config resolution order; the
 line, byte and disk caps *and their warnings*; gzip reuse; cache-hit metadata;

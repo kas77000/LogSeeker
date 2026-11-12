@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
 
@@ -122,6 +123,10 @@ class Settings:
     # change, not a code change.
     log_dir_template: str = "/apps/k/algologs/ap/{instance}/logs"
     log_glob_template: str = "APA*_pingOrderStream_{date}*.out"
+    # Days between the trading date a user asks for and the date stamped in the
+    # log filename. The US side starts each session the afternoon before, so
+    # Monday's orders are in the file named for Sunday: -1. 0 = no shift.
+    log_date_offset_days: int = 0
     instances: list[str] = field(default_factory=lambda: ["APIA", "APIB", "APIC", "APID", "APIE", "APIF", "APIG", "APIH", "APII", "APIL", "APIM"])
 
     # --- how we reach it -----------------------------------------------------
@@ -198,6 +203,13 @@ class Settings:
     def log_glob(self, instance: str, date: str) -> str:
         return self.log_glob_template.format(instance=instance, date=date)
 
+    def file_date(self, trade_date: str) -> str:
+        """YYYYMMDD stamped in the log filename for a YYYYMMDD trading date."""
+        if not self.log_date_offset_days:
+            return trade_date
+        day = datetime.strptime(trade_date, "%Y%m%d") + timedelta(days=self.log_date_offset_days)
+        return day.strftime("%Y%m%d")
+
     def describe_target(self) -> str:
         if self.backend == "local":
             return "local filesystem"
@@ -235,6 +247,7 @@ def get_settings() -> Settings:
     settings = Settings(
         log_dir_template=_get("log_dir_template", "/apps/k/algologs/ap/{instance}/logs"),
         log_glob_template=_get("log_glob_template", "APA*_pingOrderStream_{date}*.out"),
+        log_date_offset_days=_get_int("log_date_offset_days", 0),
         instances=_get_list("instances", ["APIA", "APIB", "APIC", "APID", "APIE", "APIF", "APIG", "APIH", "APII", "APIL", "APIM"]),
         backend=str(_get("backend", "ssh")).lower(),
         ssh_host=_get("ssh_host", ""),

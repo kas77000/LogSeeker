@@ -124,7 +124,8 @@ def test_filenames_are_quoted_in_grep_command(settings):
 def test_list_command_covers_every_instance_and_date(settings):
     r = validate(req(instances=["APIA", "APIE"], dates=["20260421", "20260422"]), settings)
     cmd = build_list_command(r, settings)
-    assert cmd.count("_pingOrderStream_") == 4
+    # 2 instances x 2 dates, each listed as .out and as .out.gz
+    assert cmd.count("_pingOrderStream_") == 8
     assert "APIA" in cmd and "APIE" in cmd
 
 
@@ -228,6 +229,64 @@ def test_missing_logs_fail_clearly(settings):
         time.sleep(0.1)
     assert job.status is JobStatus.FAILED
     assert "No log files" in job.error
+
+
+# --------------------------------------------------------------------------- #
+# Real filenames: session-start date, brackets, and gzip after a week
+# --------------------------------------------------------------------------- #
+
+def test_trading_date_maps_to_the_previous_days_file(settings):
+    from dataclasses import replace
+
+    shifted = replace(settings, log_date_offset_days=-1)
+    assert shifted.file_date("20261109") == "20261108"     # Monday -> Sunday's file
+    assert shifted.file_date("20261106") == "20261105"     # Friday -> Thursday's
+    assert shifted.file_date("20260301") == "20260228"     # across a month end
+    assert settings.file_date("20261109") == "20261109"    # offset 0: unchanged
+
+    cmd = build_list_command(validate(req(dates=["20261109"]), shifted), shifted)
+    assert "20261108" in cmd and "20261109" not in cmd
+    assert ".out.gz" in cmd, "compressed logs must be listed too"
+
+
+@pytest.mark.skipif(not all(shutil.which(t) for t in ("grep", "gzip", "awk")),
+                    reason="needs grep, gzip and awk on PATH")
+def test_end_to_end_over_plain_and_gzipped_logs_with_real_names(settings, tmp_path):
+    import gzip
+    from dataclasses import replace
+
+    shifted = replace(settings, log_date_offset_days=-1,
+                      log_glob_template="APA*_pingOrderStream_{date}*.out")
+    log_dir = Path(shifted.log_dir("APIA"))
+    log_dir.mkdir(parents=True, exist_ok=True)
+    # Exactly the shape on the host: the date the US side started the session,
+    # a [HH-MM-SS] stamp, and gzip once the file is about a week old.
+    (log_dir / "APA8_pingOrderStream_20261108[15-27-22].out").write_text(
+        "mon orderId=540000001 status=ACK\nmon orderId=540000002 status=ACK\n",
+        encoding="utf-8")
+    with gzip.open(log_dir / "APA8_pingOrderStream_20261105[15-27-22].out.gz", "wt") as fh:
+        fh.write("fri orderId=540000001 status=FILL\nfri orderId=540000003 status=ACK\n")
+    # Monday's own date stamp holds TUESDAY's session; it must not be read.
+    (log_dir / "APA8_pingOrderStream_20261109[15-27-22].out").write_text(
+        "tue orderId=540000001 status=WRONG_DAY\n", encoding="utf-8")
+
+    manager = JobManager(shifted)
+    job = manager.submit(validate(req(dates=["20261106", "20261109"]), shifted))
+    deadline = time.time() + 30
+    while not job.status.is_terminal and time.time() < deadline:
+        time.sleep(0.1)
+
+    assert job.status is JobStatus.DONE, job.error
+    assert job.files_found == 2
+    body = job.result_path.read_text(encoding="utf-8")
+    assert "mon orderId=540000001" in body
+    assert "fri orderId=540000001" in body, "the gzipped Thursday file was not searched"
+    assert "WRONG_DAY" not in body
+    assert "540000002" not in body and "540000003" not in body
+    # every line keeps its "<file>:" prefix, compressed or not
+    import re
+    for line in body.splitlines():
+        assert re.match(r".*pingOrderStream_[0-9]{8}\[[0-9-]+\]\.out(\.gz)?:", line), line
 
 
 if __name__ == "__main__":

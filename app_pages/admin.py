@@ -99,7 +99,7 @@ with tab_health:
     with probe[0]:
         p_instance = st.selectbox("Instance", settings.instances)
     with probe[1]:
-        p_date = st.text_input("Date (YYYYMMDD)", value="", placeholder="20260421")
+        p_date = st.text_input("Trading date (YYYYMMDD)", value="", placeholder="20260421")
     with probe[2]:
         run_probe = st.button("Probe", icon=":material/folder_open:")
 
@@ -110,6 +110,10 @@ with tab_health:
             import io
 
             req = SearchRequest(pattern="x", instances=[p_instance], dates=[p_date])
+            if settings.file_date(p_date) != p_date:
+                st.caption(f"Trading date {p_date} is in the log file dated "
+                           f"**{settings.file_date(p_date)}** "
+                           f"(LOGSEEKER_LOG_DATE_OFFSET_DAYS={settings.log_date_offset_days}).")
             buf = io.BytesIO()
             with st.spinner("Listing…"):
                 try:
@@ -215,6 +219,7 @@ with tab_config:
         "kdb_timeout": settings.kdb_timeout,
         "log_dir_template": settings.log_dir_template,
         "log_glob_template": settings.log_glob_template,
+        "log_date_offset_days": settings.log_date_offset_days,
         "instances": ", ".join(settings.instances),
         "workers": settings.workers,
         "command_timeout": settings.command_timeout,
