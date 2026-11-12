@@ -147,6 +147,29 @@ def test_missing_dotenv_is_not_an_error(monkeypatch, tmp_path):
     config_mod._dotenv.cache_clear()
 
 
+def test_a_trailing_comment_on_a_number_is_reported_not_ignored(monkeypatch, tmp_path):
+    """`=3600   # one hour` is not a number. It used to fall back to the default
+    in silence, so a raised timeout simply never took effect."""
+    monkeypatch.setattr(config_mod, "DOTENV_PATH", tmp_path / ".env")
+    (tmp_path / ".env").write_text(
+        "LOGSEEKER_COMMAND_TIMEOUT=3600   # one hour\nLOGSEEKER_WORKERS=2\n",
+        encoding="utf-8")
+    monkeypatch.delenv("LOGSEEKER_COMMAND_TIMEOUT", raising=False)
+    monkeypatch.delenv("LOGSEEKER_WORKERS", raising=False)
+    monkeypatch.setenv("LOGSEEKER_DATA_DIR", str(tmp_path / "data"))
+    config_mod._dotenv.cache_clear()
+    config_mod.get_settings.cache_clear()
+    try:
+        s = config_mod.get_settings()
+        assert s.command_timeout == 900 and s.workers == 2
+        problems = config_mod.config_problems(s)
+        assert any("LOGSEEKER_COMMAND_TIMEOUT" in p and "one hour" in p for p in problems)
+        assert not any("LOGSEEKER_WORKERS" in p for p in problems)
+    finally:
+        config_mod._dotenv.cache_clear()
+        config_mod.get_settings.cache_clear()
+
+
 # --------------------------------------------------------------------------- #
 
 def test_config_problems_flags_a_missing_ssh_identity():

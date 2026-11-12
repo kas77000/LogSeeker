@@ -457,10 +457,22 @@ file.
 
 # Working with big logs
 
-Order-stream shards run to about a gigabyte each, so a single day across three
-shards is ~3 GB and a fortnight can be 45 GB. That is the size this was built
-for. Measured against **three 1.07 GB logs, 3.21 GB and 16.5 million lines
-total**:
+**One instance's order-stream log is about 155 GB for a single day**, as one
+file (measured on the log host: `APA2_pingOrderStream_20261110[…].out`,
+155,720,530,654 bytes). That makes every search a long one. At a realistic
+50–200 MB/s, one day takes **roughly 15–50 minutes**, and the same is true for
+your colleague's legacy script; that is why it prints a heartbeat. Hence this
+deployment's `.env` settings:
+
+| Setting | Value | Why |
+|---|---|---|
+| `COMMAND_TIMEOUT` | `3600` | one day needs up to ~50 minutes |
+| `MAX_SCAN_BYTES` | `500000000000` | ~500 GB, about three days of one instance |
+| `WORKERS` | `2` | each search reads ~155 GB from a shared production host |
+
+The streaming design below keeps the app's memory flat at any size. The
+measurements were taken on smaller logs, **three 1.07 GB logs, 3.21 GB and 16.5
+million lines total**:
 
 | | |
 |---|---|
@@ -474,7 +486,7 @@ total**:
 > **On timings.** Those runs completed in seconds on a local NVMe with a warm
 > page cache, which is not a number to plan with. On a real NFS- or SAN-backed
 > log host, grep is disk-bound: expect roughly 50–200 MB/s, so 3 GB is more like
-> **15–60 seconds** and a 45 GB fortnight is **4–15 minutes**. The app is not the
+> **15–60 seconds** and one 155 GB day is **15–50 minutes**. The app is not the
 > bottleneck at any of these sizes — the log host's disk is. What the app
 > guarantees is that its own memory does not grow with the data.
 
@@ -567,9 +579,10 @@ Reach for these in order — the first is usually enough:
 
 1. **Narrow the search.** One instance, one date, Exact text rather than Pattern.
    Exact (`grep -F`) is both faster and what you want for an order id.
-2. **Raise the timeout** for wide date ranges: `LOGSEEKER_COMMAND_TIMEOUT=3600`.
-   At 50–200 MB/s, 45 GB needs 4–15 minutes; the 900 s default is not enough for
-   a full fortnight across several instances.
+2. **Raise the timeout** for wide date ranges. At 50–200 MB/s a single 155 GB
+   day needs 15–50 minutes, so the 900 s default is not enough even for one day;
+   this deployment uses `LOGSEEKER_COMMAND_TIMEOUT=3600`, and a multi-day range
+   needs more.
 3. **Raise the line cap** if you genuinely need more:
    `LOGSEEKER_MAX_RESULT_LINES=500000`.
 4. **Raise the scan cap** only deliberately: `LOGSEEKER_MAX_SCAN_BYTES`. It
@@ -604,6 +617,7 @@ Reach for these in order — the first is usually enough:
 | **"That search would scan N GB… over the limit"** | Working as intended. Narrow the range or pick one instance; raise `LOGSEEKER_MAX_SCAN_BYTES` only deliberately. |
 | **Progress bar sits at 0% for a long time** | The first batch is still running. Batches are 512 MB by default; lower `LOGSEEKER_SCAN_BATCH_BYTES` for finer updates. |
 | **Everything is slow with several people using it** | Lower `LOGSEEKER_WORKERS`. Identical searches already share one grep and are cached. |
+| **A setting you changed has no effect** | A comment after the value: `=3600  # one hour` is not a number, so the default is used. The app now says so on every page and in **Admin → Health**. Put comments on their own line. |
 | **Disk filling up** | It is bounded by `LOGSEEKER_MAX_DISK_BYTES`. Lower it, or lower `CACHE_TTL_HOURS`. |
 
 ---
@@ -742,7 +756,7 @@ finishes**, so a completed 60 MB result is not re-rendered every second.
 python -m pytest tests -q
 ```
 
-106 tests covering: input validation including a dozen shell-injection attempts;
+110 tests covering: input validation including a dozen shell-injection attempts;
 command construction and glob quoting; request identity and filename collisions;
 the CIDR allowlist and its fail-closed behaviour; config resolution order; the
 line, byte and disk caps *and their warnings*; gzip reuse; cache-hit metadata;

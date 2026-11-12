@@ -19,7 +19,7 @@ demo must not silently override it.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
@@ -91,10 +91,19 @@ def _get(key: str, default=None):
     return default
 
 
+# Number settings whose value could not be read, so the default was used.
+# "=900   # seconds" is the usual cause: the .env parser keeps everything after
+# '=' (a password may contain '#'). config_problems() reports these, so a
+# setting is never silently ignored.
+_UNREADABLE: dict[str, tuple[str, int]] = {}
+
+
 def _get_int(key: str, default: int) -> int:
+    value = _get(key, default)
     try:
-        return int(_get(key, default))
+        return int(value)
     except (TypeError, ValueError):
+        _UNREADABLE[key] = (str(value), default)
         return default
 
 
@@ -188,6 +197,9 @@ class Settings:
     # only when a reverse proxy on this machine makes every visitor loopback.
     allow_localhost: bool = True
     show_admin: bool = True
+    # ((key, value as written, default used), ...) for number settings that
+    # could not be read. Filled by get_settings(); reported by config_problems().
+    unreadable: tuple = ()
 
     @property
     def results_dir(self) -> Path:
@@ -243,6 +255,7 @@ class Settings:
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
+    _UNREADABLE.clear()
     data_dir = Path(_get("data_dir", str(DEFAULT_DATA_DIR)))
     settings = Settings(
         log_dir_template=_get("log_dir_template", "/apps/k/algologs/ap/{instance}/logs"),
@@ -281,6 +294,8 @@ def get_settings() -> Settings:
         allow_localhost=_get_bool("allow_localhost", True),
         show_admin=_get_bool("show_admin", True),
     )
+    settings = replace(settings, unreadable=tuple(
+        (key, value, default) for key, (value, default) in sorted(_UNREADABLE.items())))
     settings.results_dir.mkdir(parents=True, exist_ok=True)
     settings.audit_path.parent.mkdir(parents=True, exist_ok=True)
     return settings
@@ -289,6 +304,11 @@ def get_settings() -> Settings:
 def config_problems(settings: Settings) -> list[str]:
     """Human-readable list of things that will stop a search from working."""
     problems: list[str] = []
+    for key, value, default in settings.unreadable:
+        problems.append(
+            f"LOGSEEKER_{key.upper()}={value!r} is not a whole number, so the default "
+            f"{default} is being used. Put any comment on its own line, not after the value."
+        )
     if settings.backend not in {"ssh", "local"}:
         problems.append(f"backend must be 'ssh' or 'local', got {settings.backend!r}")
     if settings.backend == "ssh":
