@@ -113,3 +113,65 @@ def test_worker_state_rows():
     assert worker._state_rows(Table()) == [{
         "date": "2026-11-12", "id_server": "7", "first_ms": 8 * 3600 * 1000,
         "last_ms": 9 * 3600 * 1000, "last_state": "filled"}]
+
+
+# --------------------------------------------------------------------------- #
+# Commands: the probe, a ranged grep, and the file prefix
+# --------------------------------------------------------------------------- #
+
+from logseeker.search import (  # noqa: E402
+    SearchRequest, build_grep_command, build_probe_command, validate)
+
+BRACKETED = "/apps/k/algologs/ap/APII/logs/APA2_pingOrderStream_20261112[15-20-23].out"
+
+
+def _req(settings, **kw):
+    base = dict(pattern="1370037780", instances=["APIA"], dates=["20261113"])
+    base.update(kw)
+    return validate(SearchRequest(**base), settings)
+
+
+def test_order_window_is_part_of_the_cache_key(settings):
+    on = _req(settings)
+    off = _req(settings, order_window=False)
+    assert on.order_window is True and off.order_window is False
+    assert on.fingerprint() != off.fingerprint()
+
+
+def test_probe_command_seeks_and_quotes_the_bracketed_path():
+    cmd = build_probe_command(BRACKETED, 1000, 65536)
+    assert cmd == f"tail -c +1001 '{BRACKETED}' | head -c 65536"
+
+
+def test_ranged_grep_reads_only_the_range(settings):
+    r = _req(settings)
+    closed = build_grep_command([BRACKETED], r, settings, prefix=False,
+                                ranges={BRACKETED: (100, 600)})
+    assert f"tail -c +101 '{BRACKETED}' | head -c 500 | {{ grep -F -- 1370037780;" in closed
+    assert "awk" not in closed and "/dev/null" not in closed
+
+    open_ = build_grep_command([BRACKETED], r, settings, prefix=False,
+                               ranges={BRACKETED: (100, None)})
+    assert f"tail -c +101 '{BRACKETED}' | {{ grep" in open_ and "head -c 500" not in open_
+
+    prefixed = build_grep_command([BRACKETED], r, settings, prefix=True,
+                                  ranges={BRACKETED: (100, None)})
+    assert "awk -v f=" in prefixed
+
+
+def test_one_file_searches_have_no_prefix(settings):
+    r = _req(settings)
+    assert "/dev/null" not in build_grep_command(["/l/a.out"], r, settings, prefix=False)
+    assert "awk" not in build_grep_command(["/l/a.out.gz"], r, settings, prefix=False)
+    assert "/dev/null" in build_grep_command(["/l/a.out"], r, settings)   # default keeps it
+
+
+def test_pad_minutes_setting(monkeypatch):
+    from logseeker import config
+    monkeypatch.setenv("LOGSEEKER_ORDER_WINDOW_PAD_MINUTES", "7")
+    config.get_settings.cache_clear()
+    try:
+        assert config.get_settings().order_window_pad_minutes == 7
+    finally:
+        config.get_settings.cache_clear()
+    assert Settings().order_window_pad_minutes == 5

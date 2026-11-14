@@ -136,6 +136,9 @@ class Settings:
     # log filename. The US side starts each session the afternoon before, so
     # Monday's orders are in the file named for Sunday: -1. 0 = no shift.
     log_date_offset_days: int = 0
+    # Order-time window search: minutes added either side of kdb's first and last
+    # target_state time before the log is narrowed to that range.
+    order_window_pad_minutes: int = 5
     instances: list[str] = field(default_factory=lambda: ["APIA", "APIB", "APIC", "APID", "APIE", "APIF", "APIG", "APIH", "APII", "APIL", "APIM"])
 
     # --- how we reach it -----------------------------------------------------
@@ -261,6 +264,7 @@ def get_settings() -> Settings:
         log_dir_template=_get("log_dir_template", "/apps/k/algologs/ap/{instance}/logs"),
         log_glob_template=_get("log_glob_template", "APA*_pingOrderStream_{date}*.out"),
         log_date_offset_days=_get_int("log_date_offset_days", 0),
+        order_window_pad_minutes=_get_int("order_window_pad_minutes", 5),
         instances=_get_list("instances", ["APIA", "APIB", "APIC", "APID", "APIE", "APIF", "APIG", "APIH", "APII", "APIL", "APIM"]),
         backend=str(_get("backend", "ssh")).lower(),
         ssh_host=_get("ssh_host", ""),
