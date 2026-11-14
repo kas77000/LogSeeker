@@ -175,3 +175,162 @@ def test_pad_minutes_setting(monkeypatch):
     finally:
         config.get_settings.cache_clear()
     assert Settings().order_window_pad_minutes == 5
+
+
+# --------------------------------------------------------------------------- #
+# End to end: only the order's minutes are read
+# --------------------------------------------------------------------------- #
+
+from logseeker import window as win  # noqa: E402
+from logseeker.jobs import JobManager, JobStatus  # noqa: E402
+
+TOOLS = all(shutil.which(t) for t in ("grep", "tail", "head", "gzip", "awk"))
+needs_tools = pytest.mark.skipif(not TOOLS, reason="needs grep, tail, head, gzip, awk on PATH")
+ORDER = b"1370037780"
+FILE = "APA2_pingOrderStream_20261112[23-20-00].out"
+
+
+def hms(h, m, s=0):
+    return ((h * 60 + m) * 60 + s) * 1000
+
+
+def log_bytes(extra, start=hms(23, 20), end=hms(9, 0)):
+    """One heartbeat a second across midnight, a stack trace every 500 lines,
+    plus `extra` {clock ms: message} lines."""
+    out, n, t = [], 0, 0
+    span = (end - start) % win.DAY_MS
+    while t <= span:
+        clock = (start + t) % win.DAY_MS
+        ts = f"{clock // 3600000:02d}:{clock // 60000 % 60:02d}:{clock // 1000 % 60:02d},000"
+        out.append(ts.encode() + b" INFO [EngineSubscriber] heartbeat %d" % n)
+        if clock in extra:
+            out.append(ts.encode() + b" INFO [AddOrderTimer] " + extra[clock])
+        n += 1
+        if n % 500 == 0:
+            out += [b"java.lang.IllegalStateException: boom", b"\tat x.Engine.run(Engine.java:42)"]
+        t += 1000
+    return b"\n".join(out) + b"\n"
+
+
+ORDER_LINES = {
+    hms(3, 0): b"orderId=1370037780 DECOY early",
+    hms(8, 27, 31): b"orderId=1370037780 NEW",
+    hms(8, 29): b"orderId=1370037780 FILL 100",
+    hms(8, 30): b"orderId=1370037780 FILLED",
+    hms(8, 55): b"orderId=1370037780 DECOY late",
+}
+
+
+def plant(settings, instance="APIA", name=FILE, extra=ORDER_LINES, gz=False, **kw):
+    d = Path(settings.log_dir(instance))
+    d.mkdir(parents=True, exist_ok=True)
+    data = log_bytes(extra, **kw)
+    path = d / (name + (".gz" if gz else ""))
+    path.write_bytes(gzip.compress(data) if gz else data)
+    return path
+
+
+def state(first, last, last_state="filled", day="2026-11-13"):
+    return {"date": day, "id_server": "1", "first_ms": first, "last_ms": last,
+            "last_state": last_state}
+
+
+def found(*states, traders=("APIA",)):
+    return kdb.KdbCheck(kdb.FOUND, "Found.", sources=[kdb.SourceResult(
+        "HDB", "h:1", rows=[{"date": "2026-11-13", "trader": t} for t in traders],
+        states=list(states))])
+
+
+def search(settings, monkeypatch, check, *, instances=("APIA",), order_window=True):
+    monkeypatch.setattr(kdb, "lookup_target", lambda *a, **k: check)
+    req = validate(SearchRequest(pattern="1370037780", instances=list(instances),
+                                 dates=["20261113"], order_window=order_window), settings)
+    job = JobManager(settings).submit(req)
+    deadline = time.time() + 60
+    while not job.status.is_terminal and time.time() < deadline:
+        time.sleep(0.05)
+    assert job.status is JobStatus.DONE, job.error
+    return job, job.result_path.read_bytes()
+
+
+@needs_tools
+def test_a_finished_order_reads_only_its_window(settings, monkeypatch):
+    path = plant(settings)
+    job, body = search(settings, monkeypatch, found(state(hms(8, 27, 31), hms(8, 30))))
+    assert b"NEW" in body and b"FILL 100" in body and b"FILLED" in body
+    assert b"DECOY" not in body
+    assert body.startswith(b"08:27:31,000"), "one file: lines as in the raw log"
+    assert job.bytes_to_scan < path.stat().st_size / 4
+    assert any("last state `filled`" in n and "08:22:31" in n and "08:35:00" in n
+               for n in job.scan_notes), job.scan_notes
+
+
+@needs_tools
+def test_an_active_order_reads_to_the_end_of_the_file(settings, monkeypatch):
+    plant(settings)
+    job, body = search(settings, monkeypatch,
+                       found(state(hms(8, 27, 31), hms(8, 30), "activated")))
+    assert b"DECOY late" in body and b"DECOY early" not in body
+    assert any("end of file" in n for n in job.scan_notes), job.scan_notes
+
+
+@needs_tools
+def test_toggle_off_reads_the_whole_file(settings, monkeypatch):
+    path = plant(settings)
+    job, body = search(settings, monkeypatch, found(state(hms(8, 27, 31), hms(8, 30))),
+                       order_window=False)
+    assert b"DECOY early" in body and b"DECOY late" in body
+    assert job.scan_notes == []
+    assert job.bytes_to_scan >= path.stat().st_size
+
+
+@needs_tools
+def test_no_state_row_for_the_date_scans_the_whole_file(settings, monkeypatch):
+    plant(settings)
+    job, body = search(settings, monkeypatch,
+                       found(state(hms(8, 27), hms(8, 30), day="2026-11-12")))
+    assert b"DECOY early" in body
+    assert any("whole file" in n and "target_state" in n for n in job.scan_notes)
+
+
+@needs_tools
+def test_an_empty_window_falls_back_to_the_whole_file(settings, monkeypatch):
+    plant(settings)
+    job, body = search(settings, monkeypatch, found(state(hms(5, 0), hms(5, 10))))
+    assert b"NEW" in body and b"DECOY early" in body
+    assert any("whole file" in w.lower() for w in job.warnings), job.warnings
+
+
+@needs_tools
+def test_a_gzipped_log_is_scanned_whole(settings, monkeypatch):
+    plant(settings, gz=True)
+    job, body = search(settings, monkeypatch, found(state(hms(8, 27, 31), hms(8, 30))))
+    assert b"DECOY early" in body
+    assert any("gzipped" in n for n in job.scan_notes)
+
+
+@needs_tools
+def test_a_window_after_midnight(settings, monkeypatch):
+    plant(settings, extra={hms(23, 30): b"orderId=1370037780 DECOY evening",
+                           hms(0, 10): b"orderId=1370037780 NEW night"})
+    job, body = search(settings, monkeypatch, found(state(hms(0, 10), hms(0, 11))))
+    assert b"NEW night" in body and b"DECOY evening" not in body
+
+
+@needs_tools
+def test_two_files_keep_the_file_prefix(settings, monkeypatch):
+    plant(settings, "APIA")
+    plant(settings, "APIE")
+    job, body = search(settings, monkeypatch, found(state(hms(8, 27, 31), hms(8, 30))),
+                       instances=("APIA", "APIE"))
+    lines = body.splitlines()
+    assert len(lines) == 6 and all(FILE.encode() + b":08:" in ln for ln in lines)
+
+
+@needs_tools
+def test_an_open_ended_result_is_not_served_from_cache(settings, monkeypatch):
+    plant(settings)
+    check = found(state(hms(8, 27, 31), hms(8, 30), "activated"))
+    search(settings, monkeypatch, check)
+    again, _ = search(settings, monkeypatch, check)
+    assert not again.cache_hit
