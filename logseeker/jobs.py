@@ -261,6 +261,9 @@ class JobManager:
 
         self._set(job, status=JobStatus.LISTING)
 
+        # Set once the result file exists, so every way out of a failed search
+        # can delete it — a half-written file must never become a cache hit.
+        out_path: Path | None = None
         try:
             cached = store.lookup(settings, job.request)
             if cached is not None:
@@ -469,6 +472,7 @@ class JobManager:
                 lines=written["lines"],
                 bytes_written=written["bytes"],
                 truncated=job.truncated,
+                complete=not result.timed_out,
             )
 
             self._set(
@@ -497,15 +501,18 @@ class JobManager:
             )
 
         except _Cancelled:
+            store.discard(out_path)
             self._set(job, status=JobStatus.CANCELLED, finished_at=time.time(),
-                      error="Cancelled by user.")
+                      error="Cancelled by user.", result_path=None)
             audit.record(settings.audit_path, "search_cancelled",
                          job_id=job.id, user=job.request.requested_by)
         except RemoteError as exc:
+            store.discard(out_path)
             self._set(job, status=JobStatus.FAILED, finished_at=time.time(), error=str(exc))
             audit.record(settings.audit_path, "search_failed", job_id=job.id,
                          user=job.request.requested_by, error=str(exc), kind="remote")
         except Exception as exc:  # noqa: BLE001 - surfaced to the user verbatim
+            store.discard(out_path)
             self._set(job, status=JobStatus.FAILED, finished_at=time.time(), error=str(exc))
             audit.record(settings.audit_path, "search_failed", job_id=job.id,
                          user=job.request.requested_by, error=str(exc),
