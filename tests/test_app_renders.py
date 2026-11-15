@@ -231,7 +231,7 @@ def test_large_result_uses_the_two_step_download():
     _no_exceptions(at)
     labels = [d.label for d in at.get("download_button")]
     assert any(".gz" in l for l in labels), labels
-    assert any("raw .txt" in l for l in labels), labels
+    assert any("raw .log" in l for l in labels), labels
 
 
 @pytest.mark.parametrize("status, expect", [

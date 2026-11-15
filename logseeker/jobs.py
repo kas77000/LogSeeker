@@ -187,7 +187,16 @@ class JobManager:
             thread_name_prefix="logseeker",
         )
         # Results from previous runs of the app are still on disk. Clear what has
-        # expired before serving anyone, so a restart is also a tidy-up.
+        # expired before serving anyone, so a restart is also a tidy-up. Nothing
+        # is running yet, so any .part left is from a search that was cut off
+        # by the restart: incomplete, so deleted rather than renamed.
+        try:
+            leftovers = store.remove_leftover_parts(self.settings)
+            if leftovers:
+                audit.record(self.settings.audit_path, "partial_results_removed",
+                             files=leftovers)
+        except OSError:
+            pass
         self._housekeep()
 
     def _housekeep(self) -> None:
@@ -597,6 +606,15 @@ class JobManager:
             # grep: 0 = matched, 1 = no match, >1 = real error
             if result.exit_status not in (0, 1, None) and not result.truncated and not result.timed_out:
                 raise RuntimeError(result.stderr or f"grep exited {result.exit_status}")
+
+            # Everything is written: only now does the file get its real name.
+            try:
+                out_path = store.finalize(out_path)
+            except OSError as exc:
+                raise RuntimeError(
+                    f"The search finished but its result could not be saved as "
+                    f"{out_path.name[:-len(store.PART)]}: {exc}"
+                ) from exc
 
             # Sidecar so a later cache hit never has to re-read the payload to
             # find out how many lines it holds.

@@ -90,7 +90,7 @@ class SearchRequest:
         safe = re.sub(r"[^A-Za-z0-9._\-]", "_", self.pattern)[:40]
         insts = "-".join(sorted(self.instances))
         span = self.dates[0] if len(self.dates) == 1 else f"{min(self.dates)}-{max(self.dates)}"
-        return f"{safe}_{insts}_{span}_{self.fingerprint()[:8]}.txt"
+        return f"{safe}_{insts}_{span}_{self.fingerprint()[:8]}.log"
 
 
 def validate(req: SearchRequest, settings: Settings) -> SearchRequest:

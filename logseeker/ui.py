@@ -103,7 +103,10 @@ def download_button(job: Job, *, key: str, use_container_width: bool = False) ->
     from .config import get_settings
 
     path = job.result_path
-    if path is None or not path.exists() or job.lines_written == 0:
+    # Only a finished search has a result to hand out: until then the file is
+    # `<name>.log.part` and still growing.
+    if (job.status is not JobStatus.DONE or path is None or store.is_partial(path)
+            or not path.exists() or job.lines_written == 0):
         return
 
     settings = get_settings()
@@ -151,7 +154,7 @@ def download_button(job: Job, *, key: str, use_container_width: bool = False) ->
         help=f"Compressed from {human_bytes(size)}.",
     )
     st.download_button(
-        f"Download raw .txt · {human_bytes(size)}",
+        f"Download raw .log · {human_bytes(size)}",
         data=path.read_bytes(),
         file_name=path.name,
         mime="text/plain",

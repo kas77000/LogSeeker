@@ -121,3 +121,79 @@ def test_a_result_without_a_sidecar_is_not_served(settings):
     path = store.open_for_write(settings, req)
     path.write_text("")                           # what an older version left behind
     assert store.lookup(settings, req) is None
+
+
+# --------------------------------------------------------------------------- #
+# A result is only handed out once it is entirely written
+# --------------------------------------------------------------------------- #
+
+def test_the_result_is_written_as_part_and_renamed_to_log_when_finished(settings, monkeypatch):
+    seen = {}
+
+    def grep_and_look(sink):
+        sink(f"07:50:01,764 orderId=1130005583 NEW\n".encode())
+        folder = next(settings.results_dir.iterdir())
+        seen["during"] = sorted(p.name for p in folder.iterdir())
+        return ok()
+
+    job, req = run(settings, monkeypatch, grep_and_look)
+    assert job.status is JobStatus.DONE, job.error
+
+    # While grep ran, only the .part file existed — nothing anyone could take.
+    assert len(seen["during"]) == 1 and seen["during"][0].endswith(".log.part")
+
+    assert job.result_path.name.endswith(".log")
+    assert job.result_path == store.result_path(settings, req)
+    leftovers = [p.name for p in job.result_path.parent.iterdir() if p.name.endswith(".part")]
+    assert leftovers == []
+    assert job.result_path.read_bytes() == b"07:50:01,764 orderId=1130005583 NEW\n"
+
+
+def test_an_unfinished_result_is_never_compressed(tmp_path):
+    part = tmp_path / "r.log.part"
+    part.write_bytes(b"half")
+    with pytest.raises(ValueError, match="still being written"):
+        store.gzipped(part)
+
+
+def test_the_gzip_is_named_log_gz_and_leaves_no_temp_file(tmp_path):
+    import gzip
+    log = tmp_path / "r.log"
+    log.write_bytes(b"08:00:00,000 a\n" * 1000)
+    gz = store.gzipped(log)
+    assert gz.name == "r.log.gz"
+    assert gzip.decompress(gz.read_bytes()) == log.read_bytes()
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["r.log", "r.log.gz"]
+
+
+def test_a_failed_search_leaves_neither_part_nor_log(settings, monkeypatch):
+    job, req = run(settings, monkeypatch, denied)
+    assert job.status is JobStatus.FAILED
+    final = store.result_path(settings, req)
+    assert not final.exists()
+    assert not final.with_name(final.name + ".part").exists()
+
+
+def test_finalize_falls_back_to_copy_when_rename_keeps_failing(tmp_path, monkeypatch):
+    part = tmp_path / "r.log.part"
+    part.write_bytes(b"08:00:00,000 whole answer\n")
+
+    def locked(self, target):
+        raise PermissionError("file in use by another process")
+
+    monkeypatch.setattr(Path, "replace", locked)
+    final = store.finalize(part, attempts=3, wait_s=0)
+    assert final.name == "r.log"
+    assert final.read_bytes() == b"08:00:00,000 whole answer\n"
+    assert not part.exists()
+
+
+def test_a_leftover_part_from_a_restart_is_deleted_not_renamed(settings):
+    folder = settings.results_dir / "abc"
+    folder.mkdir(parents=True)
+    (folder / "r.log.part").write_bytes(b"cut off half way")
+    (folder / "done.log").write_bytes(b"finished\n")
+
+    JobManager(settings)                              # app start
+
+    assert sorted(p.name for p in folder.iterdir()) == ["done.log"]

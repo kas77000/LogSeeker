@@ -1,6 +1,6 @@
 """On-disk result storage, the identical-search cache, and disk housekeeping.
 
-Results land in ``data/results/<fingerprint>/<descriptive name>.txt`` alongside a
+Results land in ``data/results/<fingerprint>/<descriptive name>.log`` alongside a
 small ``.meta.json`` sidecar. The fingerprint directory is what makes the cache
 work: if two people ask the same question within the TTL, the second one gets the
 first one's file instantly instead of putting another multi-minute grep on the
@@ -8,6 +8,9 @@ log host.
 
 Everything here is written for results that may be tens of megabytes:
 
+* a search writes to ``<name>.log.part`` and the file is renamed to
+  ``<name>.log`` only once grep has finished, so nothing half-written is ever
+  offered for download or compressed;
 * the sidecar holds the line count so a cache hit never re-reads the payload;
 * gzip is produced once, streamed, and reused;
 * the results tree is held to a total byte budget by evicting oldest-first.
@@ -17,8 +20,11 @@ from __future__ import annotations
 
 import gzip
 import json
+import os
 import shutil
+import threading
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -115,19 +121,80 @@ def lookup(settings: Settings, req: SearchRequest) -> StoredResult | None:
     )
 
 
+PART = ".part"
+
+
+def is_partial(path: Path) -> bool:
+    return path.name.endswith(PART)
+
+
+def _final(path: Path) -> Path:
+    return path.with_name(path.name[: -len(PART)]) if is_partial(path) else path
+
+
 def open_for_write(settings: Settings, req: SearchRequest) -> Path:
+    """The ``.part`` file a search writes into; :func:`finalize` publishes it."""
     path = result_path(settings, req)
     path.parent.mkdir(parents=True, exist_ok=True)
-    # A previous run's sidecar must not vouch for what this run writes.
-    _meta_path(path).unlink(missing_ok=True)
-    return path
+    # A previous run's result must not stand in for what this run writes.
+    for old in (path, _meta_path(path), path.with_name(path.name + ".gz")):
+        old.unlink(missing_ok=True)
+    return path.with_name(path.name + PART)
+
+
+def finalize(part: Path, *, attempts: int = 5, wait_s: float = 0.2) -> Path:
+    """Flush the finished ``.part`` file to disk and give it its real name.
+    Only a finalized file is downloaded, compressed or cached.
+
+    The search has finished, so the content is whole and only the name is
+    left. On Windows a rename can fail for a moment while a virus scanner or
+    indexer holds the file open, so it is retried, then done as a copy and
+    delete. Raises OSError only if none of that works: a finished search must
+    never be left behind as ``.part``.
+    """
+    final = _final(part)
+    with part.open("rb+") as fh:
+        os.fsync(fh.fileno())
+    for attempt in range(attempts):
+        try:
+            part.replace(final)
+            return final
+        except OSError:
+            if attempt < attempts - 1:
+                time.sleep(wait_s)
+    shutil.copyfile(part, final)
+    with final.open("rb+") as fh:
+        os.fsync(fh.fileno())
+    try:
+        part.unlink()
+    except OSError:
+        pass  # the .log is complete; startup clean-up removes the stray .part
+    return final
+
+
+def remove_leftover_parts(settings: Settings) -> int:
+    """Delete every ``.part`` under the results tree. Call only when no search
+    is running (at startup): any ``.part`` then comes from a search the app was
+    stopped in the middle of, so it holds part of an answer and must never be
+    passed off as a result."""
+    if not settings.results_dir.exists():
+        return 0
+    removed = 0
+    for p in settings.results_dir.rglob(f"*{PART}"):
+        try:
+            p.unlink()
+            removed += 1
+        except OSError:
+            continue
+    return removed
 
 
 def discard(path: Path | None) -> None:
     """Remove a result that did not finish, with its sidecar and gzip."""
     if path is None:
         return
-    for p in (path, _meta_path(path), path.with_suffix(path.suffix + ".gz")):
+    final = _final(path)
+    for p in (path, final, _meta_path(final), final.with_name(final.name + ".gz")):
         try:
             p.unlink(missing_ok=True)
         except OSError:
@@ -151,20 +218,36 @@ def stored(path: Path) -> StoredResult | None:
 # Compression
 # --------------------------------------------------------------------------- #
 
+_gzip_lock = threading.Lock()
+
+
 def gzipped(path: Path) -> Path:
     """Return a gzip of ``path``, building it once and reusing it after.
 
     Grep output over order logs is highly repetitive and typically compresses
     ten-to-one, which is the difference between a 60 MB browser download and a
     6 MB one. Copied in 1 MB blocks so memory stays flat regardless of size.
+
+    Only a finished result is compressed. The gzip is built under its own
+    temporary name and renamed into place when complete, one build at a time,
+    so two people pressing "Prepare download" together never get a gzip that
+    the other is still writing.
     """
-    gz = path.with_suffix(path.suffix + ".gz")
-    if gz.exists() and gz.stat().st_mtime >= path.stat().st_mtime:
-        return gz
-    tmp = gz.with_suffix(".gz.part")
-    with path.open("rb") as src, gzip.open(tmp, "wb", compresslevel=6) as dst:
-        shutil.copyfileobj(src, dst, 1024 * 1024)
-    tmp.replace(gz)
+    if is_partial(path):
+        raise ValueError(f"{path.name} is still being written")
+    gz = path.with_name(path.name + ".gz")
+    with _gzip_lock:
+        if gz.exists() and gz.stat().st_mtime >= path.stat().st_mtime:
+            return gz
+        tmp = gz.with_name(f"{gz.name}.{uuid.uuid4().hex[:8]}{PART}")
+        try:
+            with path.open("rb") as src, gzip.open(tmp, "wb", compresslevel=6) as dst:
+                shutil.copyfileobj(src, dst, 1024 * 1024)
+            with tmp.open("rb+") as fh:
+                os.fsync(fh.fileno())
+            tmp.replace(gz)
+        finally:
+            tmp.unlink(missing_ok=True)
     return gz
 
 
@@ -247,7 +330,7 @@ def disk_usage(settings: Settings) -> tuple[int, int]:
     count = total = 0
     for p in settings.results_dir.rglob("*"):
         if p.is_file():
-            if p.suffix == ".txt":
+            if p.suffix in (".log", ".txt"):
                 count += 1
             total += p.stat().st_size
     return count, total

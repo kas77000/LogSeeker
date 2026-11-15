@@ -608,8 +608,15 @@ one.
 
 ## Downloading large results
 
+A search writes into `<name>.log.part` and the file becomes `<name>.log` only
+once grep has finished, so nothing half-written is ever downloaded, compressed
+or served from the cache. If the rename is refused (a virus scanner holding the
+file, say) it is retried and then done as a copy. A `.part` found when the app
+starts is from a search the restart cut off: it is deleted, never renamed,
+because it holds only part of the answer.
+
 Results over 2 MB need one click to prepare, then offer **gzip first** (typically
-ten-to-one on log text) with the raw `.txt` beside it.
+ten-to-one on log text) with the raw `.log` beside it.
 
 This is not politeness — it is required. `st.download_button` needs its payload
 in memory, so attaching a 60 MB file directly would re-read it on every script
@@ -727,7 +734,7 @@ the working copy. Source comments that point at `../legacy/` refer to it.
 | grep writes `$ORDER_ID.txt` on the server, a second SFTP hop fetches it | grep's stdout streams straight into the app | No temp file, no cleanup, no write permission needed on the log host, no dependency on `\\fileserver.example.internal\share\...`. |
 | Every user hand-edits `youruser` out of 6 places (that is what `Readme.txt` is for) | The operator's login lives in one `.env` | This is the single reason the legacy flow could not be shared. |
 | No match ⇒ deletes output, exits 5, WinSCP's `get` fails, operator sees `ERROR: WinSCP failed` | "No line matched" is its own reported outcome | "Nothing found" and "the transfer broke" are different answers to a client query. |
-| Output is `<ORDER_ID>.txt` in one shared directory | `<id>_<instances>_<dates>_<hash>.txt` | Two people searching the same order for different dates silently overwrote each other. |
+| Output is `<ORDER_ID>.txt` in one shared directory | `<id>_<instances>_<dates>_<hash>.log` | Two people searching the same order for different dates silently overwrote each other. |
 | Order id goes from a `.bat` variable straight into `ksh -c "…"` | Allowlist validation + `shlex.quote` everywhere | Fine for a trusted operator at a keyboard. **Remote code execution** once a web form drives it. |
 | One order id, one instance, one date | Multiple instances, date ranges, exact or regex | The follow-up question was always "and the day before?". |
 | Blocks the operator's terminal for minutes | Bounded worker pool, live progress, cancellable | Ten simultaneous requests must not become ten greps on a production host. |
@@ -801,7 +808,7 @@ finishes**, so a completed 60 MB result is not re-rendered every second.
 python -m pytest tests -q
 ```
 
-146 tests covering: input validation including a dozen shell-injection attempts;
+152 tests covering: input validation including a dozen shell-injection attempts;
 exact searches returning only whole-id matches;
 command construction and glob quoting; request identity and filename collisions;
 the CIDR allowlist and its fail-closed behaviour; config resolution order; the
