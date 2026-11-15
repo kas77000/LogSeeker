@@ -386,9 +386,13 @@ from **Admin → Storage**.
 
 Under **Advanced**. This is the one option worth understanding.
 
-**Exact text** (the default) looks for exactly what you typed. `540000001` matches
-that string and nothing else. Punctuation is just punctuation. This is what you
-want for an order id, and it is the faster of the two.
+**Exact text** (the default) looks for exactly what you typed, **as a whole id**.
+`540000001` matches `orderId=540000001`, `[540000001]`, `id:540000001,` or the id
+at the start or end of a line, but not `5400000012`, `1540000001` or a longer
+number that happens to contain it: the id must not touch a digit on either side
+(for an id with letters in it, a letter or digit). So every line returned is
+about that order, not one whose id merely contains it. Punctuation is just
+punctuation. This is what you want for an order id.
 
 **Pattern (regex)** treats your input as a regular expression, so certain
 characters become operators rather than literal text:
@@ -797,7 +801,8 @@ finishes**, so a completed 60 MB result is not re-rendered every second.
 python -m pytest tests -q
 ```
 
-145 tests covering: input validation including a dozen shell-injection attempts;
+146 tests covering: input validation including a dozen shell-injection attempts;
+exact searches returning only whole-id matches;
 command construction and glob quoting; request identity and filename collisions;
 the CIDR allowlist and its fail-closed behaviour; config resolution order; the
 line, byte and disk caps *and their warnings*; gzip reuse; cache-hit metadata,

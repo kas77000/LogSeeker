@@ -93,8 +93,10 @@ with st.form("search_form", border=True, width=FORM_WIDTH):
             options=["Exact text", "Pattern (regex)"],
             index=0,
             help=(
-                "**Exact text** looks for your input literally — `540000001` matches only "
-                "that string. This is what you want for an order id, and it is faster.\n\n"
+                "**Exact text** looks for your input literally, as a whole id — "
+                "`540000001` matches `orderId=540000001` but not `5400000012` or "
+                "`1540000001`, so only lines about that order come back. This is what "
+                "you want for an order id.\n\n"
                 "**Pattern (regex)** treats your input as a regular expression, so "
                 "`5400000(01|02)` finds either order and `orderId=54000.*FILL` finds fills "
                 "for a range of ids. Characters like `.` `*` `|` `(` become operators "

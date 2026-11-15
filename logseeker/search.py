@@ -65,6 +65,9 @@ class SearchRequest:
             self.match_mode,
             str(self.ignore_case),
             "window" if self.order_window else "whole",
+            # Exact searches match whole ids only. Results cached by the older
+            # substring match must not answer the new question.
+            "whole-id",
         ])
         return hashlib.sha256(parts.encode("utf-8")).hexdigest()[:20]
 
@@ -228,6 +231,25 @@ def build_list_command(req: SearchRequest, settings: Settings) -> str:
     return "du -k " + " ".join(globs) + " 2>/dev/null || true"
 
 
+def exact_id_regex(order_id: str) -> str:
+    """grep -E expression matching ``order_id`` only as a whole id.
+
+    A plain substring match also returns other orders: 1370037780 is inside
+    13700377801, 21370037780 and any long counter that happens to contain it.
+    So the id must not touch a digit on either side — or, for an id with
+    letters in it, a letter or digit. Punctuation around it (``=``, ``:``,
+    ``[``, ``,``, space) is fine, as is the start or end of the line.
+
+    ORDER_ID_RE limits ids to ``[A-Za-z0-9._:-]``; of those only ``.`` means
+    anything to grep -E, so it is the only one escaped. GNU grep still pulls the
+    literal id out of this expression for its fast search, so it costs about
+    the same as -F.
+    """
+    edge = "[^0-9]" if order_id.isdigit() else "[^A-Za-z0-9]"
+    literal = order_id.replace(".", r"\.")
+    return f"(^|{edge}){literal}({edge}|$)"
+
+
 def build_probe_command(path: str, offset: int, length: int) -> str:
     """Read ``length`` bytes of ``path`` from byte ``offset`` (0-based).
 
@@ -262,10 +284,11 @@ def build_grep_command(
     written while the grep runs.
     """
     ranges = ranges or {}
-    flags = ["-F"] if req.match_mode == MATCH_FIXED else ["-E"]
+    flags = ["-E"]
     if req.ignore_case:
         flags.append("-i")
-    grep = f"grep {' '.join(flags)} -- {shlex.quote(req.pattern)}"
+    expr = exact_id_regex(req.pattern) if req.match_mode == MATCH_FIXED else req.pattern
+    grep = f"grep {' '.join(flags)} -- {shlex.quote(expr)}"
     budget = int(max(1, settings.max_result_lines if line_budget is None else line_budget))
 
     windowed = [f for f in files if f in ranges]

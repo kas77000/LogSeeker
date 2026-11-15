@@ -147,7 +147,8 @@ def test_ranged_grep_reads_only_the_range(settings):
     r = _req(settings)
     closed = build_grep_command([BRACKETED], r, settings, prefix=False,
                                 ranges={BRACKETED: (100, 600)})
-    assert f"tail -c +101 '{BRACKETED}' | head -c 500 | {{ grep -F -- 1370037780;" in closed
+    assert (f"tail -c +101 '{BRACKETED}' | head -c 500 | "
+            f"{{ grep -E -- '(^|[^0-9])1370037780([^0-9]|$)';") in closed
     assert "awk" not in closed and "/dev/null" not in closed
 
     open_ = build_grep_command([BRACKETED], r, settings, prefix=False,
