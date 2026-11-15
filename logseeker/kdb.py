@@ -56,6 +56,9 @@ class SourceResult:
     rows: list[dict] = field(default_factory=list)   # {"date", "trader"}
     error: str | None = None
     info: str = ""
+    # target_state summary: {"date", "id_server", "first_ms", "last_ms", "last_state"}
+    states: list[dict] = field(default_factory=list)
+    states_error: str | None = None
 
 
 @dataclass
@@ -64,6 +67,18 @@ class KdbCheck:
     message: str = ""
     sources: list[SourceResult] = field(default_factory=list)
     skipped_dates: list[str] = field(default_factory=list)   # YYYYMMDD with no endpoint
+    rdb_date: str = ""          # YYYYMMDD the RDB answered for; its rows carry no date
+
+    @property
+    def states(self) -> list[dict]:
+        """When the order lived, per id_server and trading date (YYYYMMDD)."""
+        out = []
+        for s in self.sources:
+            for row in s.states:
+                d = row.get("date")
+                d = d.replace("-", "")[:8] if d else (self.rdb_date if s.source == "RDB" else "")
+                out.append(dict(row, date=d))
+        return out
 
     @property
     def traders(self) -> list[str]:
@@ -137,7 +152,9 @@ def _run_worker(settings: Settings, request: dict, runner=subprocess.run) -> dic
 def _sources(answer: dict) -> list[SourceResult]:
     return [SourceResult(source=s.get("source", "?"), endpoint=s.get("endpoint", "?"),
                          rows=list(s.get("rows") or []), error=s.get("error"),
-                         info=s.get("info") or "")
+                         info=s.get("info") or "",
+                         states=list(s.get("states") or []),
+                         states_error=s.get("states_error"))
             for s in answer.get("sources") or []]
 
 
@@ -187,7 +204,8 @@ def lookup_target(settings: Settings, id_target: str, dates: list[str], *,
     except Exception as exc:  # noqa: BLE001 - shown on the card
         return KdbCheck(ERROR, f"kdb lookup failed: {exc}", skipped_dates=skipped)
 
-    check = KdbCheck(NOT_FOUND, sources=sources, skipped_dates=skipped)
+    rdb_date = (today or date_cls.today()).strftime("%Y%m%d") if request["rdb"] else ""
+    check = KdbCheck(NOT_FOUND, sources=sources, skipped_dates=skipped, rdb_date=rdb_date)
     if check.rows:
         check.status = FOUND
         check.message = "Found in kdb `target`."

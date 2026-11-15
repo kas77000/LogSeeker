@@ -26,14 +26,17 @@ from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 
-from . import audit, kdb, store
+from . import audit, kdb, store, window
 from .config import Settings, get_settings
 from .remote import CommandResult, RemoteError, get_backend
 from .search import (
+    MATCH_FIXED,
+    LogFile,
     SearchRequest,
     batch_files,
     build_grep_command,
     build_list_command,
+    build_probe_command,
     ValidationError,
     parse_file_list,
     split_grep_status,
@@ -45,6 +48,7 @@ class JobStatus(str, Enum):
     QUEUED = "queued"
     CHECKING_KDB = "checking_kdb"
     LISTING = "listing"
+    LOCATING = "locating"       # placing the order's window in each log
     SEARCHING = "searching"
     DONE = "done"
     FAILED = "failed"
@@ -78,6 +82,8 @@ class Job:
     command: str = ""
     kdb: "kdb.KdbCheck | None" = None   # None until the kdb check has run
     auto_instances: bool = False        # instances were taken from kdb's trader
+    # What was read of each log: the order's window, or why the whole file.
+    scan_notes: list[str] = field(default_factory=list)
 
     _cancel: threading.Event = field(default_factory=threading.Event, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
@@ -132,6 +138,33 @@ class Job:
                 "cache_hit": self.cache_hit,
                 "truncated": self.truncated,
             }
+
+
+@dataclass
+class ScanItem:
+    """One log and the part of it to read: bytes [start, end), end None = EOF."""
+    path: str
+    size_bytes: int
+    start: int = 0
+    end: int | None = None
+    windowed: bool = False
+
+    @property
+    def length(self) -> int:
+        end = self.size_bytes if self.end is None else min(self.end, self.size_bytes)
+        return max(0, end - self.start)
+
+
+def _cut_short(result: CommandResult | None) -> bool:
+    return result is not None and (result.cancelled or result.timed_out or result.truncated)
+
+
+def trade_date_for(path: str, dates: list[str], settings: Settings) -> str | None:
+    """The requested trading date (YYYYMMDD) a log file belongs to, by the
+    date stamped in its name. None when that is not unambiguous."""
+    name = path.rsplit("/", 1)[-1]
+    hits = [d for d in dates if settings.file_date(d) in name]
+    return hits[0] if len(hits) == 1 else None
 
 
 def ui_bytes(n: int) -> str:
@@ -218,6 +251,132 @@ class JobManager:
             for key, value in fields.items():
                 setattr(job, key, value)
 
+    def _plan_ranges(self, job: Job, sess, files: list[LogFile]) -> list[ScanItem]:
+        """Narrow each log to the order's window from kdb's target_state.
+
+        Anything that stops a window being placed safely leaves that file to be
+        read whole, and the card says why — a slow answer beats a missed line.
+        """
+        settings, req = self.settings, job.request
+        items = [ScanItem(f.path, f.size_bytes) for f in files]
+        if not (req.order_window and settings.kdb_enabled and req.match_mode == MATCH_FIXED):
+            return items
+
+        check = job.kdb
+        if check is None or check.status != kdb.FOUND:
+            reason = check.message if check is not None else "kdb was not asked."
+            self._set(job, scan_notes=[f"Whole file — no order window from kdb ({reason})"])
+            return items
+
+        self._set(job, status=JobStatus.LOCATING)
+        pad = max(0, settings.order_window_pad_minutes) * 60_000
+        notes: list[str] = []
+        for item in items:
+            name = item.path.rsplit("/", 1)[-1]
+            if item.path.endswith(".gz"):
+                notes.append(f"{name}: whole file — gzipped, so it cannot be jumped into")
+                continue
+            day = trade_date_for(item.path, req.dates, settings)
+            win = window.order_window(check.states, day) if day else None
+            if win is None:
+                notes.append(f"{name}: whole file — kdb has no timed target_state row "
+                             f"for {day or 'this file'}")
+                continue
+
+            def probe(offset: int, length: int, path: str = item.path) -> bytes:
+                return self._probe(sess, job, path, offset, length)
+
+            try:
+                item.start, item.end = window.find_range(probe, item.size_bytes, win, pad)
+            except window.WindowError as exc:
+                notes.append(f"{name}: whole file — {exc}")
+                continue
+            item.windowed = True
+            upto = "end of file" if win.open_ended else window.fmt_clock(win.last_ms + pad)
+            notes.append(
+                f"{name}: {window.fmt_clock(win.first_ms - pad)} → {upto} · "
+                f"{ui_bytes(item.length)} of {ui_bytes(item.size_bytes)} · "
+                f"last state `{win.last_state}`"
+            )
+            self._set(job, scan_notes=list(notes))
+        self._set(job, scan_notes=notes)
+        return items
+
+    def _probe(self, sess, job: Job, path: str, offset: int, length: int) -> bytes:
+        """``length`` bytes of ``path`` from ``offset``, read on the log host."""
+        if job._cancel.is_set():
+            raise _Cancelled()
+        buf = io.BytesIO()
+        result = sess.run(build_probe_command(path, offset, length), sink=buf.write,
+                          timeout=30, max_bytes=length + 1, cancel=job._cancel)
+        if result.cancelled or job._cancel.is_set():
+            raise _Cancelled()
+        if result.timed_out:
+            raise window.WindowError("the log host did not answer a read in time")
+        if result.stderr:
+            raise window.WindowError(f"could not read the log: {result.stderr}")
+        return buf.getvalue()
+
+    def _scan(self, job: Job, sess, items: list[ScanItem], sink, written: dict,
+              deadline: float, prefix: bool) -> CommandResult | None:
+        """Grep ``items`` in batches; returns the last command's result."""
+        settings = self.settings
+        ranges = {i.path: (i.start, i.end) for i in items if i.windowed}
+        result = None
+        for batch in batch_files([LogFile(i.path, i.length) for i in items], settings):
+            if job._cancel.is_set():
+                raise _Cancelled()
+
+            remaining_lines = settings.max_result_lines - written["lines"]
+            if remaining_lines <= 0:
+                break
+            remaining_time = deadline - time.time()
+            if remaining_time <= 0:
+                return CommandResult(exit_status=None, stderr="", bytes_read=0,
+                                     duration_s=0.0, timed_out=True)
+
+            grep_cmd = build_grep_command(
+                [f.path for f in batch], job.request, settings,
+                line_budget=remaining_lines, prefix=prefix, ranges=ranges,
+            )
+            self._set(job, command=grep_cmd)
+
+            result = sess.run(
+                grep_cmd,
+                sink=sink,
+                timeout=int(remaining_time) + 1,
+                max_bytes=settings.max_result_bytes - written["bytes"],
+                cancel=job._cancel,
+            )
+
+            if _cut_short(result):
+                # This batch was cut short, so its bytes were NOT all read —
+                # counting them would report progress the search never made.
+                break
+
+            # grep: 0 matched, 1 no match, 2+ could not search. When the line
+            # cap is hit, head closes the pipe and grep dies of SIGPIPE (128+),
+            # which is expected, not a failure.
+            codes, host_err = split_grep_status(result.stderr)
+            capped = written["lines"] >= settings.max_result_lines
+            failed = [c for c in codes if c > 1 and not (capped and c >= 128)]
+            if failed:
+                raise RuntimeError(
+                    f"grep could not search the log on the log host "
+                    f"(exit {failed[0]})"
+                    + (f": {host_err}" if host_err else ".")
+                    + " Nothing was searched, so this is not a 'no match'."
+                )
+            if host_err and host_err not in job.warnings:
+                job.warnings.append(f"The log host reported: {host_err}")
+
+            self._set(job, bytes_scanned=job.bytes_scanned
+                      + sum(f.size_bytes for f in batch))
+
+            if result.exit_status not in (0, 1, None):
+                raise RuntimeError(host_err or f"grep exited {result.exit_status}")
+        return result
+
     def _resolve_instances(self, job: Job) -> bool:
         """Fill in an "automatic" request's instances from kdb. False = job failed."""
         settings = self.settings
@@ -261,6 +420,9 @@ class JobManager:
 
         self._set(job, status=JobStatus.LISTING)
 
+        # Set once the result file exists, so every way out of a failed search
+        # can delete it — a half-written file must never become a cache hit.
+        out_path: Path | None = None
         try:
             cached = store.lookup(settings, job.request)
             if cached is not None:
@@ -305,9 +467,7 @@ class JobManager:
                 files, capped = parse_file_list(
                     listing.getvalue().decode("utf-8", "replace"), settings
                 )
-                total_bytes = sum(f.size_bytes for f in files)
-                self._set(job, files_found=len(files), files_capped=capped,
-                          bytes_to_scan=total_bytes)
+                self._set(job, files_found=len(files), files_capped=capped)
 
                 if not files:
                     self._set(
@@ -324,9 +484,21 @@ class JobManager:
                                  pattern=job.request.pattern, dates=job.request.dates)
                     return
 
+                if capped:
+                    job.warnings.append(
+                        f"More than {settings.max_files_per_search} log files matched; "
+                        f"only the first {len(files)} were scanned. Narrow the date range."
+                    )
+
+                # --- step 1b: narrow each log to the order's minutes ----------
+                items = self._plan_ranges(job, sess, files)
+                total_bytes = sum(i.length for i in items)
+                self._set(job, bytes_to_scan=total_bytes)
+
                 # File *count* is a poor guard when a shard is a gigabyte, so
                 # refuse on total size — before reading a byte, rather than
-                # discovering it by timing out ten minutes later.
+                # discovering it by timing out ten minutes later. Checked after
+                # windowing: a 145 GB log narrowed to 1 GB is a 1 GB search.
                 if total_bytes > settings.max_scan_bytes:
                     self._set(
                         job,
@@ -344,20 +516,15 @@ class JobManager:
                                  bytes_to_scan=total_bytes, files=len(files))
                     return
 
-                if capped:
-                    job.warnings.append(
-                        f"More than {settings.max_files_per_search} log files matched; "
-                        f"only the first {len(files)} were scanned. Narrow the date range."
-                    )
-
                 # --- step 2: grep, in batches so progress is real ------------
                 self._set(job, status=JobStatus.SEARCHING)
                 out_path = store.open_for_write(settings, job.request)
 
                 written = {"bytes": 0, "lines": 0}
-                result = None
-                batches = batch_files(files, settings)
                 deadline = time.time() + settings.command_timeout
+                # One log searched: lines come back exactly as in the log. Two
+                # or more: each line says which file it came from.
+                prefix = len(files) > 1
 
                 with out_path.open("wb") as fh:
                     def sink(chunk: bytes) -> None:
@@ -369,63 +536,32 @@ class JobManager:
                                   bytes_written=written["bytes"],
                                   lines_written=written["lines"])
 
-                    for batch in batches:
-                        if job._cancel.is_set():
-                            raise _Cancelled()
+                    result = self._scan(job, sess, items, sink, written, deadline, prefix)
 
-                        remaining_lines = settings.max_result_lines - written["lines"]
-                        if remaining_lines <= 0:
-                            break
-                        remaining_time = deadline - time.time()
-                        if remaining_time <= 0:
-                            result = CommandResult(
-                                exit_status=None, stderr="", bytes_read=0,
-                                duration_s=0.0, timed_out=True,
+                    # Nothing inside the window. kdb said the order lived then,
+                    # so either the log host's clock disagrees with kdb's or the
+                    # lines are not where expected — read the whole file rather
+                    # than answer "no match" from a guess.
+                    windowed = [i for i in items if i.windowed]
+                    if windowed and written["lines"] == 0 and not _cut_short(result):
+                        whole = [ScanItem(i.path, i.size_bytes) for i in windowed]
+                        extra = sum(i.length for i in whole)
+                        if job.bytes_to_scan + extra > settings.max_scan_bytes:
+                            job.warnings.append(
+                                "Nothing matched inside the order's window from kdb, and "
+                                "reading the whole file would go over the "
+                                f"{ui_bytes(settings.max_scan_bytes)} limit, so it was not "
+                                "searched. Untick the order-window option to search it."
                             )
-                            break
-
-                        grep_cmd = build_grep_command(
-                            [f.path for f in batch], job.request, settings,
-                            line_budget=remaining_lines,
-                        )
-                        self._set(job, command=grep_cmd)
-
-                        result = sess.run(
-                            grep_cmd,
-                            sink=sink,
-                            timeout=int(remaining_time) + 1,
-                            max_bytes=settings.max_result_bytes - written["bytes"],
-                            cancel=job._cancel,
-                        )
-
-                        if result.cancelled or result.timed_out or result.truncated:
-                            # This batch was cut short, so its bytes were NOT all
-                            # read — counting them would report progress the
-                            # search never made.
-                            break
-
-                        # grep: 0 matched, 1 no match, 2+ could not search. When
-                        # the line cap is hit, head closes the pipe and grep dies
-                        # of SIGPIPE (128+), which is expected, not a failure.
-                        codes, host_err = split_grep_status(result.stderr)
-                        capped = written["lines"] >= settings.max_result_lines
-                        failed = [c for c in codes if c > 1 and not (capped and c >= 128)]
-                        if failed:
-                            raise RuntimeError(
-                                f"grep could not search the log on the log host "
-                                f"(exit {failed[0]})"
-                                + (f": {host_err}" if host_err else ".")
-                                + " Nothing was searched, so this is not a 'no match'."
+                        else:
+                            job.warnings.append(
+                                "Nothing matched inside the order's window from kdb, so the "
+                                "whole file was searched as well. If lines turn up here, "
+                                "the log's clock and kdb's disagree."
                             )
-                        if host_err and host_err not in job.warnings:
-                            job.warnings.append(f"The log host reported: {host_err}")
-
-                        self._set(job, bytes_scanned=job.bytes_scanned
-                                  + sum(f.size_bytes for f in batch))
-
-                        if result.exit_status not in (0, 1, None):
-                            raise RuntimeError(host_err or
-                                               f"grep exited {result.exit_status}")
+                            self._set(job, bytes_to_scan=job.bytes_to_scan + extra)
+                            result = self._scan(job, sess, whole, sink, written,
+                                                deadline, prefix)
 
             if result is None:
                 result = CommandResult(exit_status=0, stderr="", bytes_read=0,
@@ -469,6 +605,10 @@ class JobManager:
                 lines=written["lines"],
                 bytes_written=written["bytes"],
                 truncated=job.truncated,
+                # Read to the end of a live order's log: lines are still being
+                # written, so a cached copy would miss them.
+                complete=not result.timed_out
+                and not any(i.windowed and i.end is None for i in items),
             )
 
             self._set(
@@ -489,6 +629,7 @@ class JobManager:
                 instances=job.request.instances,
                 dates=job.request.dates,
                 files_scanned=len(files),
+                files_windowed=sum(1 for i in items if i.windowed),
                 bytes_scanned=job.bytes_scanned,
                 lines=written["lines"],
                 bytes=written["bytes"],
@@ -497,15 +638,18 @@ class JobManager:
             )
 
         except _Cancelled:
+            store.discard(out_path)
             self._set(job, status=JobStatus.CANCELLED, finished_at=time.time(),
-                      error="Cancelled by user.")
+                      error="Cancelled by user.", result_path=None)
             audit.record(settings.audit_path, "search_cancelled",
                          job_id=job.id, user=job.request.requested_by)
         except RemoteError as exc:
+            store.discard(out_path)
             self._set(job, status=JobStatus.FAILED, finished_at=time.time(), error=str(exc))
             audit.record(settings.audit_path, "search_failed", job_id=job.id,
                          user=job.request.requested_by, error=str(exc), kind="remote")
         except Exception as exc:  # noqa: BLE001 - surfaced to the user verbatim
+            store.discard(out_path)
             self._set(job, status=JobStatus.FAILED, finished_at=time.time(), error=str(exc))
             audit.record(settings.audit_path, "search_failed", job_id=job.id,
                          user=job.request.requested_by, error=str(exc),

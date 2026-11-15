@@ -36,6 +36,7 @@ STATUS_BADGE = {
     JobStatus.QUEUED: ("Queued", "gray", ":material/schedule:"),
     JobStatus.CHECKING_KDB: ("Checking kdb", "blue", ":material/database:"),
     JobStatus.LISTING: ("Finding logs", "blue", ":material/folder_open:"),
+    JobStatus.LOCATING: ("Finding window", "blue", ":material/schedule:"),
     JobStatus.SEARCHING: ("Searching", "blue", ":material/search:"),
     JobStatus.DONE: ("Done", "green", ":material/check_circle:"),
     JobStatus.FAILED: ("Failed", "red", ":material/error:"),

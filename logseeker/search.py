@@ -50,6 +50,8 @@ class SearchRequest:
     ignore_case: bool = False
     requested_by: str = "unknown"
     note: str = ""
+    # Read only the order's minutes of each log, from kdb's target_state.
+    order_window: bool = True
 
     def fingerprint(self) -> str:
         """Identity of the *search*, independent of who asked or when.
@@ -62,6 +64,10 @@ class SearchRequest:
             ",".join(sorted(self.dates)),
             self.match_mode,
             str(self.ignore_case),
+            "window" if self.order_window else "whole",
+            # Exact searches match whole ids only. Results cached by the older
+            # substring match must not answer the new question.
+            "whole-id",
         ])
         return hashlib.sha256(parts.encode("utf-8")).hexdigest()[:20]
 
@@ -154,6 +160,7 @@ def validate(req: SearchRequest, settings: Settings) -> SearchRequest:
         ignore_case=req.ignore_case,
         requested_by=req.requested_by,
         note=req.note.strip()[:200],
+        order_window=req.order_window,
     )
 
 
@@ -224,27 +231,69 @@ def build_list_command(req: SearchRequest, settings: Settings) -> str:
     return "du -k " + " ".join(globs) + " 2>/dev/null || true"
 
 
+def exact_id_regex(order_id: str) -> str:
+    """grep -E expression matching ``order_id`` only as a whole id.
+
+    A plain substring match also returns other orders: 1370037780 is inside
+    13700377801, 21370037780 and any long counter that happens to contain it.
+    So the id must not touch a digit on either side — or, for an id with
+    letters in it, a letter or digit. Punctuation around it (``=``, ``:``,
+    ``[``, ``,``, space) is fine, as is the start or end of the line.
+
+    ORDER_ID_RE limits ids to ``[A-Za-z0-9._:-]``; of those only ``.`` means
+    anything to grep -E, so it is the only one escaped. GNU grep still pulls the
+    literal id out of this expression for its fast search, so it costs about
+    the same as -F.
+    """
+    edge = "[^0-9]" if order_id.isdigit() else "[^A-Za-z0-9]"
+    literal = order_id.replace(".", r"\.")
+    return f"(^|{edge}){literal}({edge}|$)"
+
+
+def build_probe_command(path: str, offset: int, length: int) -> str:
+    """Read ``length`` bytes of ``path`` from byte ``offset`` (0-based).
+
+    `tail -c +N` on a regular file seeks to N rather than reading up to it, so a
+    probe costs the same anywhere in a 145 GB log. That is what lets
+    window.find_range binary-search a file by its timestamps.
+    """
+    return f"tail -c +{int(offset) + 1} {shlex.quote(path)} | head -c {int(length)}"
+
+
 def build_grep_command(
     files: list[str],
     req: SearchRequest,
     settings: Settings,
     *,
     line_budget: int | None = None,
+    prefix: bool = True,
+    ranges: dict[str, tuple[int, int | None]] | None = None,
 ) -> str:
     """Step 2: grep an explicit, fully quoted file list.
 
     ``line_budget`` caps this batch. When a search is split across batches the
     budget is what remains of ``max_result_lines``, so the overall cap stays
     exact instead of being applied per batch.
+
+    ``prefix`` puts ``<file>:`` in front of every line. The job passes it only
+    when the search covers two or more files; with one, lines come back exactly
+    as they are in the log.
+
+    ``ranges`` maps a plain file to ``(start, end)`` byte offsets — the order's
+    window. ``end`` None reads to the end of the file, including anything
+    written while the grep runs.
     """
-    flags = ["-F"] if req.match_mode == MATCH_FIXED else ["-E"]
+    ranges = ranges or {}
+    flags = ["-E"]
     if req.ignore_case:
         flags.append("-i")
-    grep = f"grep {' '.join(flags)} -- {shlex.quote(req.pattern)}"
+    expr = exact_id_regex(req.pattern) if req.match_mode == MATCH_FIXED else req.pattern
+    grep = f"grep {' '.join(flags)} -- {shlex.quote(expr)}"
     budget = int(max(1, settings.max_result_lines if line_budget is None else line_budget))
 
-    plain = [f for f in files if not f.endswith(".gz")]
-    packed = [f for f in files if f.endswith(".gz")]
+    windowed = [f for f in files if f in ranges]
+    plain = [f for f in files if not f.endswith(".gz") and f not in ranges]
+    packed = [f for f in files if f.endswith(".gz") and f not in ranges]
 
     # `| head` makes the pipeline's exit status head's, which is always 0, so a
     # grep that could not read its file looked exactly like "no line matched".
@@ -253,20 +302,31 @@ def build_grep_command(
     # the older shells on these hosts may not have.
     report = f'echo "{GREP_RC_MARKER}$?" >&2'
 
+    def streamed(source: str, f: str) -> str:
+        # grep cannot name a pipe, so awk restores the "<file>:" prefix and
+        # every result line looks the same whichever path produced it.
+        part = f"{source} | {{ {grep}; {report}; }}"
+        if prefix:
+            part += f" | awk -v f={shlex.quote(f)} '{{print f \":\" $0}}'"
+        return part
+
     parts = []
     if plain:
         # /dev/null as a trailing operand forces grep to prefix every match with
         # its filename even when only one log matched — `grep -H` is not
         # portable to the older greps on these hosts.
-        parts.append(f"{{ {grep} {' '.join(shlex.quote(f) for f in plain)} /dev/null; "
+        null = " /dev/null" if prefix else ""
+        parts.append(f"{{ {grep} {' '.join(shlex.quote(f) for f in plain)}{null}; "
                      f"{report}; }}")
     for f in packed:
-        # Older logs are gzipped. Decompress on the host and grep the stream;
-        # awk restores the "<file>:" prefix grep cannot add to a pipe, so every
-        # result line looks the same whichever kind of file it came from.
-        q = shlex.quote(f)
-        parts.append(f"gzip -dc {q} | {{ {grep}; {report}; }} "
-                     f"| awk -v f={q} '{{print f \":\" $0}}'")
+        # Older logs are gzipped. Decompress on the host and grep the stream.
+        parts.append(streamed(f"gzip -dc {shlex.quote(f)}", f))
+    for f in windowed:
+        start, end = ranges[f]
+        source = f"tail -c +{int(start) + 1} {shlex.quote(f)}"
+        if end is not None:
+            source += f" | head -c {max(0, int(end) - int(start))}"
+        parts.append(streamed(source, f))
 
     if len(parts) == 1:
         return f"{parts[0]} | head -n {budget}"

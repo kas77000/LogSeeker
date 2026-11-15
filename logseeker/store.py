@@ -46,13 +46,18 @@ def result_path(settings: Settings, req: SearchRequest) -> Path:
     return settings.results_dir / req.fingerprint() / req.result_filename()
 
 
-def write_meta(path: Path, *, lines: int, bytes_written: int, truncated: bool) -> None:
+def write_meta(path: Path, *, lines: int, bytes_written: int, truncated: bool,
+               complete: bool = True) -> None:
+    """``complete`` False keeps the file for its own job's download but never
+    serves it as a cache hit: a search that timed out, or one that read to the
+    end of a log that is still being written, is not the full answer."""
     try:
         _meta_path(path).write_text(
             json.dumps({
                 "lines": lines,
                 "bytes": bytes_written,
                 "truncated": truncated,
+                "complete": complete,
                 "written_at": time.time(),
             }),
             encoding="utf-8",
@@ -86,7 +91,12 @@ def count_lines(path: Path) -> int:
 
 
 def lookup(settings: Settings, req: SearchRequest) -> StoredResult | None:
-    """Return a fresh cached result for this exact search, or None."""
+    """Return a fresh cached result for this exact search, or None.
+
+    Only a result whose sidecar says it is complete is served. A result file
+    exists from the moment a search starts, so its existence proves nothing: a
+    search that failed or was interrupted must never answer the next person.
+    """
     if settings.cache_ttl_hours <= 0:
         return None
     path = result_path(settings, req)
@@ -97,7 +107,9 @@ def lookup(settings: Settings, req: SearchRequest) -> StoredResult | None:
         return None
 
     meta = read_meta(path)
-    lines = meta["lines"] if meta and "lines" in meta else count_lines(path)
+    if not meta or meta.get("complete") is not True:
+        return None
+    lines = meta["lines"] if "lines" in meta else count_lines(path)
     return StoredResult(
         path=path, size_bytes=stat.st_size, created_at=stat.st_mtime, lines=lines
     )
@@ -106,7 +118,20 @@ def lookup(settings: Settings, req: SearchRequest) -> StoredResult | None:
 def open_for_write(settings: Settings, req: SearchRequest) -> Path:
     path = result_path(settings, req)
     path.parent.mkdir(parents=True, exist_ok=True)
+    # A previous run's sidecar must not vouch for what this run writes.
+    _meta_path(path).unlink(missing_ok=True)
     return path
+
+
+def discard(path: Path | None) -> None:
+    """Remove a result that did not finish, with its sidecar and gzip."""
+    if path is None:
+        return
+    for p in (path, _meta_path(path), path.with_suffix(path.suffix + ".gz")):
+        try:
+            p.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def stored(path: Path) -> StoredResult | None:

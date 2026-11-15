@@ -154,8 +154,43 @@ def test_grep_command_forces_filename_prefix_and_caps_lines(settings):
     assert f"head -n {settings.max_result_lines}" in cmd
 
 
-def test_exact_mode_uses_fixed_string_matching(settings):
-    assert " -F " in build_grep_command(["/a"], validate(req(), settings), settings)
+def test_exact_mode_matches_the_id_only_as_a_whole_number(settings):
+    from logseeker.search import exact_id_regex
+
+    cmd = build_grep_command(["/a"], validate(req(), settings), settings)
+    assert " -E " in cmd and " -F " not in cmd
+    assert "'(^|[^0-9])540000001([^0-9]|$)'" in cmd
+    # ids with letters: no letter or digit either side; '.' is literal
+    assert exact_id_regex("ORD-1.5") == r"(^|[^A-Za-z0-9])ORD-1\.5([^A-Za-z0-9]|$)"
+
+
+@pytest.mark.skipif(shutil.which("grep") is None, reason="needs grep on PATH")
+def test_exact_search_returns_only_lines_about_that_order(settings):
+    log_dir = Path(settings.log_dir("APIA"))
+    log_dir.mkdir(parents=True)
+    ours = [
+        "08:27:31,897 INFO [AddOrderTimer] orderId=540000001 NEW",
+        "540000001 at the start of the line",
+        "08:27:32,000 INFO fill for [540000001]",
+        "08:27:33,000 INFO id_target:540000001,qty=100",
+        "08:27:34,000 INFO at the end 540000001",
+    ]
+    others = [
+        "08:27:31,898 INFO orderId=5400000012 NEW",        # ours + a digit
+        "08:27:31,899 INFO orderId=1540000001 NEW",        # a digit + ours
+        "08:27:31,900 INFO seq=99540000001123 heartbeat",  # inside a longer number
+        "08:27:31,901 INFO orderId=540000002 NEW",
+    ]
+    (log_dir / "APA1_pingOrderStream_20260421_1.out").write_text(
+        "\n".join(ours[:2] + others + ours[2:]) + "\n", encoding="utf-8")
+
+    job = JobManager(settings).submit(validate(req(), settings))
+    deadline = time.time() + 30
+    while not job.status.is_terminal and time.time() < deadline:
+        time.sleep(0.1)
+    assert job.status is JobStatus.DONE, job.error
+    got = job.result_path.read_text(encoding="utf-8").splitlines()
+    assert got == ours
 
 
 # --------------------------------------------------------------------------- #

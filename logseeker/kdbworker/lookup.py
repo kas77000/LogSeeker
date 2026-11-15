@@ -25,6 +25,10 @@ Request:
 Answer:
     {"sources": [{"source": "RDB" | "HDB", "endpoint": "host:port",
                   "rows": [{"date": "2026-11-12" | null, "trader": "..."}],
+                  "states": [{"date": "2026-11-12" | null, "id_server": "...",
+                              "first_ms": 30451897, "last_ms": 34865000,
+                              "last_state": "filled"}],
+                  "states_error": null | "...",
                   "error": null | "...", "info": "..."}]}
 """
 
@@ -49,6 +53,23 @@ RDB_FN = """
 HDB_FN = """
 {[ds;x;n] n sublist distinct select date, trader from target
     where date in ds, id_target=x }
+"""
+
+# When did the order live, and is it still live? One row per id_server (and
+# date on the HDB): first and last `time`, and the state at the last one.
+# Rows with a null time cannot be placed in the day — as midnight they would
+# become the first event — so they are dropped, as kdb-queries' luld_orders does.
+RDB_STATE_FN = """
+{[x] 0!select first_time:first time, last_time:last time, last_state:last state
+    by id_server from `time xasc
+    select id_server, time, state from target_state where id_target=x, not null time }
+"""
+
+HDB_STATE_FN = """
+{[ds;x] 0!select first_time:first time, last_time:last time, last_state:last state
+    by date, id_server from `date`time xasc
+    select date, id_server, time, state from target_state
+    where date in ds, id_target=x, not null time }
 """
 
 PING_FN = "{[] (string .z.h; .z.K; string .z.p)}[]"
@@ -101,10 +122,51 @@ def _rows(table) -> list[dict]:
     return out
 
 
+def _ms(value) -> int | None:
+    """A q time (pandas Timedelta / timedelta / time) as ms since midnight."""
+    if value is None:
+        return None
+    if isinstance(value, dt.time):
+        return ((value.hour * 60 + value.minute) * 60 + value.second) * 1000 \
+            + value.microsecond // 1000
+    if hasattr(value, "total_seconds"):
+        try:
+            seconds = float(value.total_seconds())
+        except (TypeError, ValueError):
+            return None
+        if seconds != seconds:          # NaT
+            return None
+        return int(round(seconds * 1000))
+    return None
+
+
+def _state_rows(table) -> list[dict]:
+    frame = table.pd()
+    out = []
+    for record in frame.to_dict("records"):
+        out.append({"date": _text(record.get("date")),
+                    "id_server": _text(record.get("id_server")),
+                    "first_ms": _ms(record.get("first_time")),
+                    "last_ms": _ms(record.get("last_time")),
+                    "last_state": _text(record.get("last_state"))})
+    return out
+
+
+def _lookup(conn, rows_fn: str, state_fn: str, args: tuple, n) -> dict:
+    """Trader rows, then the order's times. The second query has its own try:
+    if it fails the trader still comes back, and the search scans whole files."""
+    out = {"rows": _rows(conn(rows_fn, *args, n))}
+    try:
+        out["states"] = _state_rows(conn(state_fn, *args))
+    except Exception as exc:  # noqa: BLE001 - reported, never fatal
+        out["states_error"] = f"{type(exc).__name__}: {exc}"
+    return out
+
+
 def _one(kx, source: str, endpoint, req: dict, run) -> dict:
     host, port = endpoint
     entry = {"source": source, "endpoint": f"{host}:{port}",
-             "rows": [], "error": None, "info": ""}
+             "rows": [], "states": [], "states_error": None, "error": None, "info": ""}
     try:
         with _connect(kx, host, port, req) as conn:
             entry.update(run(conn))
@@ -134,13 +196,13 @@ def handle(req: dict) -> dict:
 
     if req.get("rdb"):
         sources.append(_one(kx, "RDB", req["rdb"], req,
-                            lambda conn: {"rows": _rows(conn(RDB_FN, ident, n))}))
+                            lambda conn: _lookup(conn, RDB_FN, RDB_STATE_FN, (ident,), n)))
 
     dates = [dt.date.fromisoformat(d) for d in req.get("hdb_dates") or []]
     if dates and req.get("hdb"):
         ds = kx.toq(dates, ktype=kx.DateVector)
         sources.append(_one(kx, "HDB", req["hdb"], req,
-                            lambda conn: {"rows": _rows(conn(HDB_FN, ds, ident, n))}))
+                            lambda conn: _lookup(conn, HDB_FN, HDB_STATE_FN, (ds, ident), n)))
 
     return {"sources": sources}
 

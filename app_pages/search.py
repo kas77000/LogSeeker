@@ -93,8 +93,10 @@ with st.form("search_form", border=True, width=FORM_WIDTH):
             options=["Exact text", "Pattern (regex)"],
             index=0,
             help=(
-                "**Exact text** looks for your input literally — `540000001` matches only "
-                "that string. This is what you want for an order id, and it is faster.\n\n"
+                "**Exact text** looks for your input literally, as a whole id — "
+                "`540000001` matches `orderId=540000001` but not `5400000012` or "
+                "`1540000001`, so only lines about that order come back. This is what "
+                "you want for an order id.\n\n"
                 "**Pattern (regex)** treats your input as a regular expression, so "
                 "`5400000(01|02)` finds either order and `orderId=54000.*FILL` finds fills "
                 "for a range of ids. Characters like `.` `*` `|` `(` become operators "
@@ -102,6 +104,22 @@ with st.form("search_form", border=True, width=FORM_WIDTH):
             ),
         )
         ignore_case = st.toggle("Ignore upper/lower case", value=False)
+        if settings.kdb_enabled:
+            order_window = st.toggle(
+                "Search only the order's active window (from kdb)",
+                value=True,
+                help=(
+                    "Reads only the part of each log between the order's first "
+                    f"`target_state` time − {settings.order_window_pad_minutes} min and its "
+                    f"last + {settings.order_window_pad_minutes} min — or to the end of the "
+                    "log while it is still `activated` — instead of the whole file. "
+                    "Falls back to the whole file when kdb has no times for it, the "
+                    "log is gzipped, or nothing matches inside the window.\n\n"
+                    "Off: read every log in full."
+                ),
+            )
+        else:
+            order_window = False
         if date_mode == "Date range":
             skip_weekends = st.toggle(
                 "Skip weekends", value=True,
@@ -121,6 +139,7 @@ if submitted:
         ignore_case=ignore_case,
         requested_by=user,
         note=note,
+        order_window=order_window,
     )
     try:
         request = validate(request, settings)
@@ -193,6 +212,8 @@ def render_job(j, *, live: bool) -> None:
         if j.auto_instances:
             st.caption(f":material/auto_awesome: Instance from kdb: "
                        f"**{', '.join(j.request.instances)}**")
+        for note in j.scan_notes:
+            st.caption(f":material/schedule: {note}")
 
         if j.status is JobStatus.QUEUED:
             st.caption(
@@ -204,6 +225,8 @@ def render_job(j, *, live: bool) -> None:
             st.caption("Asking kdb whether this id_target exists…")
         elif j.status is JobStatus.LISTING:
             st.caption("Working out which log files exist for those dates…")
+        elif j.status is JobStatus.LOCATING:
+            st.caption("Finding the order's minutes in the log…")
         elif j.status is JobStatus.SEARCHING:
             eta = j.eta_seconds
             st.caption(

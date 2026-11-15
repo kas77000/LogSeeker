@@ -220,6 +220,7 @@ with tab_config:
         "log_dir_template": settings.log_dir_template,
         "log_glob_template": settings.log_glob_template,
         "log_date_offset_days": settings.log_date_offset_days,
+        "order_window_pad_minutes": settings.order_window_pad_minutes,
         "instances": ", ".join(settings.instances),
         "workers": settings.workers,
         "command_timeout": settings.command_timeout,

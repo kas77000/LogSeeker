@@ -386,9 +386,13 @@ from **Admin → Storage**.
 
 Under **Advanced**. This is the one option worth understanding.
 
-**Exact text** (the default) looks for exactly what you typed. `540000001` matches
-that string and nothing else. Punctuation is just punctuation. This is what you
-want for an order id, and it is the faster of the two.
+**Exact text** (the default) looks for exactly what you typed, **as a whole id**.
+`540000001` matches `orderId=540000001`, `[540000001]`, `id:540000001,` or the id
+at the start or end of a line, but not `5400000012`, `1540000001` or a longer
+number that happens to contain it: the id must not touch a digit on either side
+(for an id with letters in it, a letter or digit). So every line returned is
+about that order, not one whose id merely contains it. Punctuation is just
+punctuation. This is what you want for an order id.
 
 **Pattern (regex)** treats your input as a regular expression, so certain
 characters become operators rather than literal text:
@@ -439,6 +443,46 @@ pykx connects over IPC only, so no q licence is needed. Each lookup runs in its
 own short-lived Python process (`logseeker/kdbworker/lookup.py`), so a pykx
 failure cannot take the app down. **Admin → Health → kdb** has a connection
 test and a one-off id lookup.
+
+## Searching only the order's window
+
+An order's lines sit in a few minutes of a log that can be 145 GB. With
+**Advanced → "Search only the order's active window (from kdb)"** on (the
+default), the same kdb call that finds the trader also asks `target_state` when
+the order lived:
+
+| last `target_state.state` | what is read |
+|---|---|
+| anything but `` `activated `` | first time − 5 min → last time + 5 min |
+| `` `activated `` | first time − 5 min → end of the log |
+
+The app then **jumps** into the log instead of reading it from the top. Every line
+starts with an `HH:MM:SS,mmm` timestamp and the file is in time order, so it reads
+64 KB in the middle, looks at the timestamp, halves, and repeats: a few dozen
+small reads place the window in any file, however big. Only that byte range is
+grepped (`tail -c +START | head -c LENGTH | grep`), so a search that read 145 GB
+reads a gigabyte or so, and the progress bar measures that range.
+
+Times are HKT on both sides. The session start is taken from the log's first
+line, not from the `[HH-MM-SS]` in its name, so a session that runs past midnight
+is handled.
+
+**The card says what was read** for each file, e.g. *"08:22:31 → 09:46:05 ·
+1.1 GB of 145 GB · last state `filled`"*. A file is read **whole**, with the
+reason on the card, when:
+
+- it is gzipped (older than about a week: a gzip stream cannot be jumped into);
+- kdb has no `target_state` row with a time for that date, or kdb did not answer;
+- no timestamp could be found where the app looked;
+- the window matched **nothing**: the whole file is then searched as well, in
+  case the log's clock and kdb's disagree.
+
+Turn the option off to read every log in full. Regex searches always do. The
+padding is `LOGSEEKER_ORDER_WINDOW_PAD_MINUTES` (default 5). A search that read to
+the end of a live order's log is not cached, since the log is still being written.
+
+With one log in the search, result lines are exactly as in the log; with two or
+more, each line starts with `<file>:` so you can tell them apart.
 
 ## Running several searches at once
 
@@ -650,6 +694,7 @@ setting.
 | `LOG_DIR_TEMPLATE` | `/apps/k/algologs/ap/{instance}/logs` | Where logs live |
 | `LOG_GLOB_TEMPLATE` | `APA*_pingOrderStream_{date}*.out` | Which files to scan; `.out.gz` is matched too |
 | `LOG_DATE_OFFSET_DAYS` | `0` (`-1` in `.env`) | Days from trading date to the filename's date. `-1`: Monday's orders are in Sunday's file |
+| `ORDER_WINDOW_PAD_MINUTES` | `5` | Minutes either side of kdb's first/last `target_state` time when searching only the order's window |
 | `INSTANCES` | `APIA,APIB,APIC,APID,APIE,APIF,APIG,APIH,APII,APIL,APIM` | Allowlist; nothing outside it can be searched |
 | `ALLOWED_NETWORKS` | *(empty)* | CIDR allowlist. The app's only access control. |
 | `ALLOW_LOCALHOST` | `true` | Always admit the host machine's own browser. `false` behind a same-machine reverse proxy. |
@@ -756,12 +801,16 @@ finishes**, so a completed 60 MB result is not re-rendered every second.
 python -m pytest tests -q
 ```
 
-110 tests covering: input validation including a dozen shell-injection attempts;
+146 tests covering: input validation including a dozen shell-injection attempts;
+exact searches returning only whole-id matches;
 command construction and glob quoting; request identity and filename collisions;
 the CIDR allowlist and its fail-closed behaviour; config resolution order; the
-line, byte and disk caps *and their warnings*; gzip reuse; cache-hit metadata;
+line, byte and disk caps *and their warnings*; gzip reuse; cache-hit metadata,
+and that failed, cancelled and timed-out searches are never served from cache;
 audit tail-reads; kdb RDB/HDB routing, failure reporting and a real
-worker against a dead port; an end-to-end search through the local backend; and headless
+worker against a dead port; the order-time window (timestamp binary search,
+midnight wrap, every whole-file fallback) end to end on a generated log; an
+end-to-end search through the local backend; and headless
 renders of all three pages via `streamlit.testing.v1.AppTest`.
 
 ---
