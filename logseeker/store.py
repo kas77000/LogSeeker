@@ -221,6 +221,24 @@ def stored(path: Path) -> StoredResult | None:
 _gzip_lock = threading.Lock()
 
 
+def gzip_member_name(gz: Path) -> str | None:
+    """The file name stored in a gzip's header, which is what 7-Zip, WinRAR and
+    ``gunzip -N`` call the file inside. None if there is none or it is unreadable."""
+    try:
+        with gz.open("rb") as fh:
+            head = fh.read(10)
+            if len(head) < 10 or head[:2] != b"\x1f\x8b" or not head[3] & 0x08:
+                return None
+            if head[3] & 0x04:                        # optional extra field first
+                fh.seek(int.from_bytes(fh.read(2), "little"), os.SEEK_CUR)
+            name = bytearray()
+            while (byte := fh.read(1)) not in (b"", b"\x00") and len(name) < 1024:
+                name += byte
+            return name.decode("latin-1")
+    except OSError:
+        return None
+
+
 def gzipped(path: Path) -> Path:
     """Return a gzip of ``path``, building it once and reusing it after.
 
@@ -237,11 +255,16 @@ def gzipped(path: Path) -> Path:
         raise ValueError(f"{path.name} is still being written")
     gz = path.with_name(path.name + ".gz")
     with _gzip_lock:
-        if gz.exists() and gz.stat().st_mtime >= path.stat().st_mtime:
+        if (gz.exists() and gz.stat().st_mtime >= path.stat().st_mtime
+                and gzip_member_name(gz) == path.name):
             return gz
         tmp = gz.with_name(f"{gz.name}.{uuid.uuid4().hex[:8]}{PART}")
         try:
-            with path.open("rb") as src, gzip.open(tmp, "wb", compresslevel=6) as dst:
+            # gzip records a file name in its header, and unzip tools show it as
+            # the file inside. Left to itself it records the name it is writing
+            # to - the temporary one - so name the log explicitly.
+            with path.open("rb") as src, tmp.open("wb") as raw, gzip.GzipFile(
+                    filename=path.name, mode="wb", compresslevel=6, fileobj=raw) as dst:
                 shutil.copyfileobj(src, dst, 1024 * 1024)
             with tmp.open("rb+") as fh:
                 os.fsync(fh.fileno())

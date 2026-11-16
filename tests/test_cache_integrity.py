@@ -166,6 +166,29 @@ def test_the_gzip_is_named_log_gz_and_leaves_no_temp_file(tmp_path):
     assert sorted(p.name for p in tmp_path.iterdir()) == ["r.log", "r.log.gz"]
 
 
+def test_the_file_inside_the_gzip_is_named_after_the_log(tmp_path):
+    # 7-Zip and WinRAR show the name stored in the gzip header, not the name of
+    # the .gz itself. It used to be the temporary "r.log.gz.<id>.part".
+    log = tmp_path / "r.log"
+    log.write_bytes(b"08:00:00,000 a\n" * 1000)
+    assert store.gzip_member_name(store.gzipped(log)) == "r.log"
+
+
+def test_a_gzip_built_with_the_temp_name_inside_is_rebuilt(tmp_path):
+    import gzip
+    log = tmp_path / "r.log"
+    log.write_bytes(b"08:00:00,000 a\n" * 1000)
+    stale = tmp_path / "r.log.gz.137643f5.part"
+    with gzip.open(stale, "wb") as fh:                # how it used to be built
+        fh.write(log.read_bytes())
+    stale.replace(tmp_path / "r.log.gz")
+    assert store.gzip_member_name(tmp_path / "r.log.gz") == "r.log.gz.137643f5.part"
+
+    gz = store.gzipped(log)
+    assert store.gzip_member_name(gz) == "r.log"
+    assert gzip.decompress(gz.read_bytes()) == log.read_bytes()
+
+
 def test_a_failed_search_leaves_neither_part_nor_log(settings, monkeypatch):
     job, req = run(settings, monkeypatch, denied)
     assert job.status is JobStatus.FAILED
