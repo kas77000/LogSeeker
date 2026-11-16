@@ -7,6 +7,9 @@ textColor = "#E6E9EF"
 font = "sans serif"
 
 [server]
+# 8501 (Streamlit's default) is taken by another app on this machine.
+# run.ps1 passes its own -Port, which defaults to the same value.
+port = 8510
 # Nothing is ever uploaded to this app, so keep the limit minimal.
 maxUploadSize = 5
 # Leave XSRF protection on. It implies CORS restrictions, so do not also set

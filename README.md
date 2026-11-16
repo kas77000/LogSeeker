@@ -70,7 +70,7 @@ python tools\make_demo.py
 streamlit run streamlit_app.py
 ```
 
-Open <http://localhost:8501>. Search for order id **`540000001`**, instance
+Open <http://localhost:8510>. Search for order id **`540000001`**, instance
 `APIA`, today's date. You should get a few hundred matching lines within a
 second, with a download button.
 
@@ -329,7 +329,7 @@ every page — that warning is accurate, not decoration.
 
 ```powershell
 New-NetFirewallRule -DisplayName "LogSeeker" -Direction Inbound `
-    -LocalPort 8501 -Protocol TCP -Action Allow -Profile Domain,Private
+    -LocalPort 8510 -Protocol TCP -Action Allow -Profile Domain,Private
 ```
 
 Then start it for the network:
