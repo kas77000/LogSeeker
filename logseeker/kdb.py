@@ -41,6 +41,7 @@ WORKER = Path(__file__).resolve().parent / "kdbworker" / "lookup.py"
 STARTUP_ALLOWANCE_S = 60
 
 MAX_ROWS = 100
+DETAILS_MAX_ROWS = 500
 
 
 FOUND = "found"
@@ -88,6 +89,17 @@ class KdbCheck:
                 t = row.get("trader")
                 if t and t not in seen:
                     seen.append(t)
+        return seen
+
+    @property
+    def symbols(self) -> list[str]:
+        """The order's `target`.sym values, in first-seen order — what quoteStream greps."""
+        seen: list[str] = []
+        for s in self.sources:
+            for row in s.rows:
+                sym = (row.get("sym") or "").strip()
+                if sym and sym not in seen:
+                    seen.append(sym)
         return seen
 
     @property
@@ -216,6 +228,88 @@ def lookup_target(settings: Settings, id_target: str, dates: list[str], *,
         asked = " and ".join(s.source for s in sources)
         check.message = f"No `target` with id_target `{id_target}` in the {asked} for those dates."
     return check
+
+
+@dataclass
+class DetailsSource:
+    source: str                 # "RDB" | "HDB"
+    endpoint: str
+    target: list[dict] = field(default_factory=list)
+    workorder: list[dict] = field(default_factory=list)
+    target_error: str | None = None
+    workorder_error: str | None = None
+    error: str | None = None    # could not connect at all
+
+
+@dataclass
+class OrderDetails:
+    id_target: str
+    sources: list[DetailsSource] = field(default_factory=list)
+    error: str | None = None    # nothing could be asked
+    skipped_dates: list[str] = field(default_factory=list)
+
+
+def _by_t_gen(rows: list[dict]) -> list[dict]:
+    """Children in the order they were made; rows without t_gen go last."""
+    if not any("t_gen" in r for r in rows):
+        return rows
+    return sorted(rows, key=lambda r: (r.get("t_gen") is None, str(r.get("t_gen") or "")))
+
+
+def order_details(settings: Settings, id_target: str, dates: list[str], *,
+                  today: date_cls | None = None, runner=subprocess.run) -> OrderDetails:
+    """Every column of the order's `target` row(s) and of its `workorder`s."""
+    details = OrderDetails(id_target)
+    if not settings.kdb_enabled:
+        details.error = "kdb is not configured."
+        return details
+    if not kdb_id_ok(id_target or ""):
+        details.error = (f"`{id_target}` cannot be a kdb id_target (a whole number up to "
+                         f"{KDB_ID_MAX:,}).")
+        return details
+    if not pykx_installed():
+        details.error = "pykx is not installed — run `pip install -r requirements.txt`."
+        return details
+    try:
+        rdb = parse_endpoint(settings.kdb_rdb)
+        hdb = parse_endpoint(settings.kdb_hdb)
+    except ValueError as exc:
+        details.error = f"kdb endpoint misconfigured: {exc}"
+        return details
+
+    day = today or date_cls.today()
+    want_rdb, hdb_dates = split_dates(dates, day)
+    if want_rdb and rdb is None:
+        details.skipped_dates.append(day.strftime("%Y%m%d"))
+    if hdb_dates and hdb is None:
+        details.skipped_dates.extend(hdb_dates)
+    request = {
+        "op": "details", "id": id_target, "max_rows": DETAILS_MAX_ROWS,
+        "rdb": list(rdb) if want_rdb and rdb else None,
+        "hdb": list(hdb) if hdb_dates and hdb else None,
+        "hdb_dates": [_iso(d) for d in hdb_dates] if hdb else [],
+    }
+    if request["rdb"] is None and request["hdb"] is None:
+        details.error = "No kdb endpoint is configured for those dates."
+        return details
+
+    try:
+        answer = _run_worker(settings, request, runner)
+    except subprocess.TimeoutExpired:
+        details.error = "kdb did not answer in time."
+        return details
+    except Exception as exc:  # noqa: BLE001 - shown in the dialog
+        details.error = f"kdb lookup failed: {exc}"
+        return details
+
+    for s in answer.get("sources") or []:
+        details.sources.append(DetailsSource(
+            source=s.get("source", "?"), endpoint=s.get("endpoint", "?"),
+            target=list(s.get("target") or []),
+            workorder=_by_t_gen(list(s.get("workorder") or [])),
+            target_error=s.get("target_error"), workorder_error=s.get("workorder_error"),
+            error=s.get("error")))
+    return details
 
 
 def ping(settings: Settings, runner=subprocess.run) -> list[SourceResult]:

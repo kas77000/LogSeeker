@@ -132,6 +132,9 @@ class Settings:
     # change, not a code change.
     log_dir_template: str = "/apps/k/algologs/ap/{instance}/logs"
     log_glob_template: str = "APA*_pingOrderStream_{date}*.out"
+    # The quote stream, in the same folder: quotestream.261116-152206.log.
+    # {yymmdd} is the file date as six digits; {date} (YYYYMMDD) also works.
+    quote_glob_template: str = "quotestream.{yymmdd}-*.log"
     # Days between the trading date a user asks for and the date stamped in the
     # log filename. The US side starts each session the afternoon before, so
     # Monday's orders are in the file named for Sunday: -1. 0 = no shift.
@@ -215,8 +218,10 @@ class Settings:
     def log_dir(self, instance: str) -> str:
         return self.log_dir_template.format(instance=instance)
 
-    def log_glob(self, instance: str, date: str) -> str:
-        return self.log_glob_template.format(instance=instance, date=date)
+    def log_glob(self, instance: str, date: str, stream: str = "order") -> str:
+        """Filename glob of one stream's log for a YYYYMMDD *file* date."""
+        template = self.quote_glob_template if stream == "quote" else self.log_glob_template
+        return template.format(instance=instance, date=date, yymmdd=date[2:])
 
     def file_date(self, trade_date: str) -> str:
         """YYYYMMDD stamped in the log filename for a YYYYMMDD trading date."""
@@ -263,6 +268,7 @@ def get_settings() -> Settings:
     settings = Settings(
         log_dir_template=_get("log_dir_template", "/apps/k/algologs/ap/{instance}/logs"),
         log_glob_template=_get("log_glob_template", "APA*_pingOrderStream_{date}*.out"),
+        quote_glob_template=_get("quote_glob_template", "quotestream.{yymmdd}-*.log"),
         log_date_offset_days=_get_int("log_date_offset_days", 0),
         order_window_pad_minutes=_get_int("order_window_pad_minutes", 5),
         instances=_get_list("instances", ["APIA", "APIB", "APIC", "APID", "APIE", "APIF", "APIG", "APIH", "APII", "APIL", "APIM"]),
@@ -358,4 +364,6 @@ def config_problems(settings: Settings) -> list[str]:
         problems.append("log_dir_template does not contain {instance}")
     if "{date}" not in settings.log_glob_template:
         problems.append("log_glob_template does not contain {date}")
+    if "{yymmdd}" not in settings.quote_glob_template and "{date}" not in settings.quote_glob_template:
+        problems.append("quote_glob_template contains neither {yymmdd} nor {date}")
     return problems

@@ -46,6 +46,15 @@ def settings(tmp_path: Path) -> Settings:
     )
 
 
+@pytest.fixture(autouse=True)
+def _pykx(request, monkeypatch):
+    """The fake runner replaces the worker, so pykx itself is never needed —
+    without this every routing test stops at "pykx is not installed" on a
+    machine without it. The real-worker test keeps the real check."""
+    if "real_worker" not in request.node.name:
+        monkeypatch.setattr(kdb, "pykx_installed", lambda: True)
+
+
 class FakeRunner:
     """Stands in for subprocess.run: records the request, returns an answer."""
 

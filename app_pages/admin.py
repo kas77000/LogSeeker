@@ -219,6 +219,7 @@ with tab_config:
         "kdb_timeout": settings.kdb_timeout,
         "log_dir_template": settings.log_dir_template,
         "log_glob_template": settings.log_glob_template,
+        "quote_glob_template": settings.quote_glob_template,
         "log_date_offset_days": settings.log_date_offset_days,
         "order_window_pad_minutes": settings.order_window_pad_minutes,
         "instances": ", ".join(settings.instances),

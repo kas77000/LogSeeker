@@ -137,15 +137,16 @@ def test_submitting_a_valid_search_starts_a_job():
     _no_exceptions(at)
 
     # AppTest.session_state is not a plain dict — no .get().
-    assert "ls_my_jobs" in at.session_state, "expected a tracked job in session state"
+    assert "ls_my_searches" in at.session_state, "expected a tracked card in session state"
 
     from logseeker.jobs import get_manager
 
-    job = get_manager().get(at.session_state["ls_my_jobs"][0])
-    assert job is not None
-    assert job.request.pattern == "540000001"
+    search = get_manager().get_search(at.session_state["ls_my_searches"][0])
+    assert search is not None
+    assert search.request.pattern == "540000001"
+    assert search.streams == ["order"]
     # The typed name is a label for the audit trail, not an authenticated user.
-    assert "tester" in job.request.requested_by
+    assert "tester" in search.request.requested_by
 
 
 def test_a_second_search_does_not_replace_the_first():
@@ -155,11 +156,11 @@ def test_a_second_search_does_not_replace_the_first():
 
     _submit(at, "540000001")
     _no_exceptions(at)
-    first = at.session_state["ls_my_jobs"][0]
+    first = at.session_state["ls_my_searches"][0]
 
     _submit(at, "540000002")
     _no_exceptions(at)
-    tracked = list(at.session_state["ls_my_jobs"])
+    tracked = list(at.session_state["ls_my_searches"])
 
     assert len(tracked) == 2, "both searches should be tracked"
     assert tracked[0] != first and first in tracked, "newest first, first one kept"
@@ -167,7 +168,7 @@ def test_a_second_search_does_not_replace_the_first():
     from logseeker.jobs import get_manager
 
     manager = get_manager()
-    patterns = {manager.get(j).request.pattern for j in tracked}
+    patterns = {manager.get_search(s).request.pattern for s in tracked}
     assert patterns == {"540000001", "540000002"}
 
 
@@ -241,25 +242,112 @@ def test_large_result_uses_the_two_step_download():
 ])
 def test_kdb_result_is_shown_on_the_card(status, expect):
     from logseeker import kdb
-    from logseeker.jobs import Job, JobStatus, get_manager
-    from logseeker.search import SearchRequest
 
     rows = [{"date": "2026-11-12", "trader": "jdoe"}] if status == "found" else []
     message = {"found": "Found.", "not_found": "No target with that id.",
                "error": "kdb lookup failed: refused"}[status]
-    job = Job(id=f"kdb{status}", status=JobStatus.FAILED, error="no logs",
-              request=SearchRequest(pattern="540000001", instances=["APIA"],
-                                    dates=["20261112"]),
-              kdb=kdb.KdbCheck(status, message, sources=[
-                  kdb.SourceResult("HDB", "h:1", rows=rows)]))
-    manager = get_manager()
-    with manager._lock:
-        manager._jobs[job.id] = job
+    check = kdb.KdbCheck(status, message, sources=[kdb.SourceResult("HDB", "h:1", rows=rows)])
+    search = _card(f"kdb{status}", check, [("order", "FAILED", "no logs")])
 
-    at = _app(ls_my_jobs=[job.id]).run()
+    at = _app(ls_my_searches=[search.id]).run()
     _no_exceptions(at)
     shown = [e.value for e in (*at.success, *at.warning, *at.error)]
     assert any(expect in v for v in shown), shown
+    details = [b for b in at.button if b.label == "Order details"]
+    assert bool(details) == (status == "found"), "Order details only once kdb found it"
+
+
+def _card(card_id, check, streams):
+    """Put a finished card with one job per (stream, status, error) in the manager."""
+    from logseeker.jobs import Job, JobStatus, Search, get_manager
+    from logseeker.search import SearchRequest
+
+    base = SearchRequest(pattern="540000001", instances=["APIA"], dates=["20261112"])
+    jobs = [Job(id=f"{card_id}_{stream}", status=JobStatus[status], error=error, kdb=check,
+                request=SearchRequest(**{**base.__dict__, "stream": stream,
+                                         "symbols": ["0700.HK"] if stream == "quote" else []}))
+            for stream, status, error in streams]
+    search = Search(id=card_id, request=base, streams=[s for s, _, _ in streams],
+                    status=JobStatus.SEARCHING, kdb=check, jobs=jobs)
+    manager = get_manager()
+    with manager._lock:
+        manager._searches[search.id] = search
+        for j in jobs:
+            manager._jobs[j.id] = j
+    return search
+
+
+def _found():
+    from logseeker import kdb
+    return kdb.KdbCheck(kdb.FOUND, "Found.", sources=[kdb.SourceResult(
+        "HDB", "h:1", rows=[{"date": "2026-11-12", "trader": "APIA", "sym": "0700.HK"}])])
+
+
+def test_a_two_log_card_shows_a_row_per_log():
+    search = _card("two", _found(), [
+        ("order", "FAILED", "No log files exist for that instance/date combination."),
+        ("quote", "SKIPPED", "Not searched — kdb has no timed target_state row for 20261112")])
+    at = _app(ls_my_searches=[search.id]).run()
+    _no_exceptions(at)
+    text = " ".join(m.value for m in at.markdown)
+    assert "orderStream" in text and "quoteStream" in text and "0700.HK" in text
+    assert any("Not searched" in i.value for i in at.info)
+    assert any("No log files" in e.value for e in at.error)
+
+
+def test_order_details_dialog_shows_target_and_workorders(monkeypatch):
+    from logseeker import kdb
+
+    asked = []
+
+    def fake_details(settings, id_target, dates, **kw):
+        asked.append((id_target, dates))
+        return kdb.OrderDetails(id_target, sources=[kdb.DetailsSource(
+            "HDB", "h:1",
+            target=[{"date": "2026-11-12", "id_target": 540000001, "sym": "0700.HK"}],
+            workorder=[{"id_work": 1, "t_gen": "08:27:31.897"},
+                       {"id_work": 2, "t_gen": "08:30:00.000"}])])
+
+    monkeypatch.setattr(kdb, "order_details", fake_details)
+    search = _card("details", _found(), [("order", "DONE", "")])
+    at = _app(ls_my_searches=[search.id]).run()
+    _no_exceptions(at)
+    [b for b in at.button if b.label == "Order details"][0].click().run()
+    _no_exceptions(at)
+    assert asked == [("540000001", ["20261112"])]
+    sections = [e.label for e in at.expander]
+    assert "**target** · 1 row(s)" in sections, sections
+    assert "**workorder** · 2 row(s)" in sections, sections
+    assert len(at.dataframe) == 2
+
+    at.run()                                            # reopened from the session
+    _no_exceptions(at)
+    assert len(asked) == 1, "a rerun must not ask kdb again"
+
+
+@pytest.fixture
+def _kdb_on(monkeypatch):
+    import logseeker.config as config_mod
+    monkeypatch.setenv("LOGSEEKER_KDB_RDB", "rdb-host:5012")
+    monkeypatch.setenv("LOGSEEKER_KDB_HDB", "hdb-host:5010")
+    config_mod.get_settings.cache_clear()
+    yield
+    monkeypatch.undo()
+    config_mod.get_settings.cache_clear()
+
+
+def test_logs_picker_with_kdb_defaults_to_orderstream(_kdb_on):
+    at = _app().run()
+    _no_exceptions(at)
+    pills = [w for w in at.get("button_group") if w.label == "Logs"]
+    assert pills and pills[0].value == ["order"], [w.label for w in at.get("button_group")]
+
+    pills[0].set_value(["order", "quote"])
+    at.multiselect[0].set_value([at.multiselect[0].options[0]])
+    at.radio[0].set_value("Pattern (regex)")
+    _submit(at, "5400.*")
+    _no_exceptions(at)
+    assert any("quoteStream" in e.value for e in at.error), [e.value for e in at.error]
 
 
 if __name__ == "__main__":

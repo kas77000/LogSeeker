@@ -5,6 +5,7 @@ submitted gets its own status card, so you can fire off a second order id while
 the first is still scanning and watch both.
 """
 
+from dataclasses import replace
 from datetime import date
 
 import streamlit as st
@@ -15,6 +16,9 @@ from logseeker.jobs import JobStatus, get_manager
 from logseeker.search import (
     MATCH_FIXED,
     MATCH_REGEX,
+    STREAM_NAMES,
+    STREAM_ORDER,
+    STREAM_QUOTE,
     SearchRequest,
     ValidationError,
     date_range,
@@ -29,8 +33,9 @@ FORM_WIDTH = 560
 
 st.title("Search order logs")
 st.caption(
-    f"Greps `{settings.log_glob_template}` under "
-    f"`{settings.log_dir_template}` on {settings.describe_target()}."
+    f"Greps `{settings.log_glob_template}`"
+    + (f" and `{settings.quote_glob_template}`" if settings.kdb_enabled else "")
+    + f" under `{settings.log_dir_template}` on {settings.describe_target()}."
 )
 
 # --------------------------------------------------------------------------- #
@@ -81,6 +86,26 @@ with st.form("search_form", border=True, width=FORM_WIDTH):
         start = st.date_input("Date", value=today, max_value=today, format="YYYY-MM-DD")
         end = start
 
+    # quoteStream is greped for the order's symbol inside the order's window,
+    # both of which only kdb knows — so it is offered only with kdb.
+    if settings.kdb_enabled:
+        streams = st.pills(
+            "Logs",
+            options=[STREAM_ORDER, STREAM_QUOTE],
+            format_func=STREAM_NAMES.get,
+            selection_mode="multi",
+            default=[STREAM_ORDER],
+            help=(
+                "**orderStream** — lines with this order id.\n\n"
+                "**quoteStream** — the order's symbol (kdb `target`.sym), only between "
+                f"its first `target_state` time − {settings.order_window_pad_minutes} min "
+                f"and its last + {settings.order_window_pad_minutes} min. Each log gets "
+                "its own result file."
+            ),
+        ) or []
+    else:
+        streams = [STREAM_ORDER]
+
     note = st.text_input(
         "Reason (optional)",
         placeholder="e.g. INC0123456 — client query on fill price",
@@ -130,6 +155,7 @@ with st.form("search_form", border=True, width=FORM_WIDTH):
 
     submitted = st.form_submit_button("Search", type="primary", icon=":material/search:")
 
+
 if submitted:
     request = SearchRequest(
         pattern=pattern,
@@ -142,42 +168,48 @@ if submitted:
         order_window=order_window,
     )
     try:
+        if not streams:
+            raise ValidationError("Pick at least one log — orderStream or quoteStream.")
         request = validate(request, settings)
+        if STREAM_QUOTE in streams:
+            # quoteStream has rules of its own (exact id, kdb); say so now
+            # rather than as a skipped row a few seconds later.
+            validate(replace(request, stream=STREAM_QUOTE), settings)
     except ValidationError as exc:
         st.error(str(exc), icon=":material/error:")
     else:
         # An automatic request has no instances yet, so it cannot be a cache hit
-        # until the job has asked kdb; the toast is for explicit requests only.
-        cached = store.lookup(settings, request) if request.instances else None
-        job = manager.submit(request)
+        # until kdb has been asked; the toast is for explicit requests only.
+        cached = (store.lookup(settings, request)
+                  if request.instances and STREAM_ORDER in streams else None)
+        new = manager.submit_search(request, [s for s in (STREAM_ORDER, STREAM_QUOTE)
+                                              if s in streams])
 
-        # Track every job this session started, newest first, rather than a
+        # Track every card this session started, newest first, rather than a
         # single "current" one — that is what lets a second search be queued
         # while the first is still running.
-        tracked = [j for j in st.session_state.get("ls_my_jobs", []) if j != job.id]
-        st.session_state.ls_my_jobs = [job.id] + tracked[:19]
+        tracked = [i for i in st.session_state.get("ls_my_searches", []) if i != new.id]
+        st.session_state.ls_my_searches = [new.id] + tracked[:19]
 
         if cached is not None:
-            st.toast("Served from cache — this exact search ran recently.",
+            st.toast("orderStream served from cache — this exact search ran recently.",
                      icon=":material/bolt:")
 
 # --------------------------------------------------------------------------- #
 # Status cards for everything this session submitted
 # --------------------------------------------------------------------------- #
 
-def render_kdb(j) -> None:
+def render_kdb(check) -> None:
     """What kdb's `target` table said about this id. Never blocks the grep."""
-    check = j.kdb
     if check is None:       # kdb not configured, or the check has not run yet
         return
 
     if check.status == kdb.FOUND:
         traders = ", ".join(f"**{t}**" for t in check.traders) or "no trader recorded"
-        st.success(f"id_target exists in kdb — trader: {traders}",
+        syms = ", ".join(f"`{s}`" for s in check.symbols)
+        st.success(f"id_target exists in kdb — trader: {traders}"
+                   + (f" · sym: {syms}" if syms else ""),
                    icon=":material/database:")
-        if len(check.rows) > 1 or any(r.get("date") for r in check.rows):
-            with st.expander(f"kdb rows ({len(check.rows)})", icon=":material/table:"):
-                st.dataframe(check.rows, hide_index=True, use_container_width=True)
     elif check.status == kdb.NOT_FOUND:
         st.warning(
             f"{check.message} The log search still runs — but check the id and date.",
@@ -196,22 +228,17 @@ def render_kdb(j) -> None:
         st.caption(f"Not checked in kdb: {which}.")
 
 
-def render_job(j, *, live: bool) -> None:
-    """One job's status card. ``live`` says whether we are inside the ticking
-    fragment, which decides how a Cancel click reruns."""
+def render_stream(j, *, live: bool) -> None:
+    """One log of a card: its status, line count, notes and download."""
     with st.container(border=True):
         head = st.columns([3, 1], vertical_alignment="center")
         with head[0]:
-            st.markdown(f"**{j.request.label()}**")
-            if j.request.note:
-                st.caption(j.request.note)
+            st.markdown(f"**{j.request.stream_name}**"
+                        + (" · " + ", ".join(f"`{s}`" for s in j.request.symbols)
+                           if j.request.symbols else ""))
         with head[1]:
             ui.status_badge(j)
 
-        render_kdb(j)
-        if j.auto_instances:
-            st.caption(f":material/auto_awesome: Instance from kdb: "
-                       f"**{', '.join(j.request.instances)}**")
         for note in j.scan_notes:
             st.caption(f":material/schedule: {note}")
 
@@ -245,14 +272,18 @@ def render_job(j, *, live: bool) -> None:
 
         if j.status is JobStatus.FAILED:
             st.error(j.error, icon=":material/error:")
+        elif j.status is JobStatus.SKIPPED:
+            st.info(j.error, icon=":material/block:")
         elif j.status is JobStatus.CANCELLED:
             st.info(j.error or "Cancelled.", icon=":material/cancel:")
         elif j.status is JobStatus.DONE:
+            what = (f"`{', '.join(j.request.symbols)}`" if j.request.symbols
+                    else f"`{j.request.pattern}`")
             if j.lines_written == 0:
                 st.warning(
                     f"Scanned {ui.human_bytes(j.bytes_scanned)} across {j.files_found} "
                     f"log file(s) in {ui.human_duration(j.elapsed)} — no line matched "
-                    f"`{j.request.pattern}`.",
+                    f"{what}.",
                     icon=":material/search_off:",
                 )
             else:
@@ -273,12 +304,6 @@ def render_job(j, *, live: bool) -> None:
                     st.rerun(scope="fragment" if live else "app")
             else:
                 ui.download_button(j, key=f"dl_live_{j.id}")
-                if st.button("Dismiss", icon=":material/close:", key=f"clear_{j.id}"):
-                    st.session_state.ls_my_jobs = [
-                        i for i in st.session_state.get("ls_my_jobs", []) if i != j.id
-                    ]
-                    st.session_state.pop("ls_prepared_download", None)
-                    st.rerun()
 
         if j.status is JobStatus.DONE and j.lines_written and j.result_path:
             with st.expander(f"Preview — first lines of {j.result_path.name}",
@@ -286,33 +311,79 @@ def render_job(j, *, live: bool) -> None:
                 st.code(ui.preview_text(j.result_path), language="log", line_numbers=False)
 
 
-def my_jobs():
-    """Jobs this session submitted that still exist in the manager."""
+def render_search(s, *, live: bool) -> None:
+    """One card: the kdb check once, then a row per log. ``live`` says whether
+    we are inside the ticking fragment, which decides how a click reruns."""
+    with st.container(border=True):
+        head = st.columns([3, 1], vertical_alignment="center")
+        with head[0]:
+            st.markdown(f"**{s.request.label(with_stream=False)}**")
+            if s.request.note:
+                st.caption(s.request.note)
+        with head[1]:
+            ui.search_badge(s)
+
+        render_kdb(s.kdb)
+        if s.kdb is not None and s.kdb.status == kdb.FOUND:
+            if st.button("Order details", icon=":material/receipt_long:",
+                         key=f"details_{s.id}",
+                         help="The order's `target` row and its `workorder`s, from kdb."):
+                # Opened from the full script, not from inside the ticking
+                # fragment, so the dialog survives the fragment's reruns.
+                st.session_state.ls_details_open = s.id
+                st.rerun(scope="app")
+        if s.auto_instances:
+            st.caption(f":material/auto_awesome: Instance from kdb: "
+                       f"**{', '.join(s.request.instances)}**")
+        for warning in s.warnings:
+            st.warning(warning, icon=":material/warning:")
+
+        if s.status is JobStatus.QUEUED:
+            st.caption(f"Waiting for a free worker ({manager.settings.workers} run at a time)…")
+        elif s.status is JobStatus.CHECKING_KDB:
+            st.caption("Asking kdb about this id_target…")
+        elif s.status is JobStatus.FAILED:
+            st.error(s.error, icon=":material/error:")
+
+        for j in s.jobs:
+            render_stream(j, live=live)
+
+        if s.is_terminal:
+            if st.button("Dismiss", icon=":material/close:", key=f"clear_{s.id}"):
+                st.session_state.ls_my_searches = [
+                    i for i in st.session_state.get("ls_my_searches", []) if i != s.id
+                ]
+                st.session_state.pop("ls_prepared_download", None)
+                st.rerun()
+
+
+def my_searches():
+    """Cards this session submitted that still exist in the manager."""
     out = []
-    for job_id in st.session_state.get("ls_my_jobs", []):
-        job = manager.get(job_id)
-        if job is not None:
-            out.append(job)
+    for search_id in st.session_state.get("ls_my_searches", []):
+        s = manager.get_search(search_id)
+        if s is not None:
+            out.append(s)
     return out
 
 
 def render_all(*, live: bool) -> None:
-    jobs = my_jobs()
-    if not jobs:
+    searches = my_searches()
+    if not searches:
         return
-    running = sum(1 for j in jobs if not j.status.is_terminal)
-    header = f"Your searches ({len(jobs)})"
+    running = sum(1 for s in searches if not s.is_terminal)
+    header = f"Your searches ({len(searches)})"
     if running:
         header += f" · {running} running"
     st.subheader(header)
-    for j in jobs:
-        render_job(j, live=live)
+    for s in searches:
+        render_search(s, live=live)
 
 
 @st.fragment(run_every=1.0)
 def live_panel() -> None:
-    jobs = my_jobs()
-    if jobs and all(j.status.is_terminal for j in jobs):
+    searches = my_searches()
+    if searches and all(s.is_terminal for s in searches):
         # Everything settled: hand off to the static renderer and stop ticking.
         # Left running, a finished job would re-render once a second — and every
         # tick would re-read the result file behind its download button.
@@ -320,15 +391,82 @@ def live_panel() -> None:
     render_all(live=True)
 
 
-if any(not j.status.is_terminal for j in my_jobs()):
+if any(not s.is_terminal for s in my_searches()):
     live_panel()
 else:
     render_all(live=False)
 
+
+# --------------------------------------------------------------------------- #
+# Order details
 # --------------------------------------------------------------------------- #
 
-others = [j for j in manager.recent(5)
-          if j.id not in set(st.session_state.get("ls_my_jobs", []))]
+def _close_details() -> None:
+    st.session_state.pop("ls_details_open", None)
+
+
+def _table(title: str, rows: list[dict], error: str | None, empty: str, *,
+           key: str) -> None:
+    """One table in a section that can be folded away; open to start with."""
+    label = f"**{title}**" + (f" · {len(rows)} row(s)" if rows else "")
+    with st.expander(label, expanded=True, key=key):
+        if error:
+            st.warning(error, icon=":material/warning:")
+        elif not rows:
+            st.caption(empty)
+        elif len(rows) == 1:
+            # One row of many columns reads better down the page than across it.
+            st.dataframe([{"column": k, "value": "" if v is None else str(v)}
+                          for k, v in rows[0].items()],
+                         hide_index=True, use_container_width=True)
+        else:
+            st.dataframe(rows, hide_index=True, use_container_width=True)
+
+
+@st.dialog("Order details", width="large", on_dismiss=_close_details)
+def order_details_dialog(search) -> None:
+    req = search.request
+    key = f"ls_details_{req.pattern}_{','.join(req.dates)}"
+    head = st.columns([4, 1], vertical_alignment="center")
+    with head[0]:
+        st.markdown(f"id_target **{req.pattern}** · {', '.join(req.dates)}")
+    with head[1]:
+        if st.button("Refresh", icon=":material/refresh:", key="details_refresh"):
+            st.session_state.pop(key, None)
+
+    if key not in st.session_state:
+        with st.spinner("Asking kdb…"):
+            st.session_state[key] = kdb.order_details(settings, req.pattern, req.dates)
+    details = st.session_state[key]
+
+    if details.error:
+        st.error(details.error, icon=":material/error:")
+    for src in details.sources:
+        st.subheader(f"{src.source} · `{src.endpoint}`", divider="gray")
+        if src.error:
+            st.error(src.error, icon=":material/error:")
+            continue
+        _table("target", src.target, src.target_error, "No target row.",
+               key=f"details_target_{src.source}")
+        _table("workorder", src.workorder, src.workorder_error, "No workorder for this order.",
+               key=f"details_workorder_{src.source}")
+    if details.skipped_dates:
+        st.caption(f"Not asked: {', '.join(details.skipped_dates)} — no kdb endpoint "
+                   "configured for those dates.")
+
+
+details_for = st.session_state.get("ls_details_open")
+if details_for:
+    shown = manager.get_search(details_for)
+    if shown is None:
+        _close_details()
+    else:
+        order_details_dialog(shown)
+
+# --------------------------------------------------------------------------- #
+
+mine = {j.id for s in my_searches() for j in s.jobs}
+others = [j for j in manager.recent(5) if j.id not in mine]
 if others:
     st.subheader("Recent searches by others")
     for j in others:

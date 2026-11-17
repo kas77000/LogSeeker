@@ -41,6 +41,7 @@ STATUS_BADGE = {
     JobStatus.DONE: ("Done", "green", ":material/check_circle:"),
     JobStatus.FAILED: ("Failed", "red", ":material/error:"),
     JobStatus.CANCELLED: ("Cancelled", "orange", ":material/cancel:"),
+    JobStatus.SKIPPED: ("Skipped", "gray", ":material/block:"),
 }
 
 
@@ -48,6 +49,20 @@ def status_badge(job: Job) -> None:
     label, color, icon = STATUS_BADGE[job.status]
     if job.status is JobStatus.DONE and job.lines_written == 0:
         label, color, icon = "No matches", "orange", ":material/search_off:"
+    st.badge(label, icon=icon, color=color)
+
+
+def search_badge(search) -> None:
+    """One badge for a whole card: still working, or how its logs ended."""
+    if search.status is not JobStatus.SEARCHING:
+        label, color, icon = STATUS_BADGE[search.status]
+    elif not search.is_terminal:
+        label, color, icon = STATUS_BADGE[JobStatus.SEARCHING]
+    elif any(j.status is JobStatus.DONE for j in search.jobs):
+        label, color, icon = STATUS_BADGE[JobStatus.DONE]
+    else:
+        label, color, icon = STATUS_BADGE[search.jobs[0].status if search.jobs
+                                          else JobStatus.FAILED]
     st.badge(label, icon=icon, color=color)
 
 
