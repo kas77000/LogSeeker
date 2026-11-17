@@ -36,6 +36,30 @@ def kdb_id_ok(pattern: str) -> bool:
 MATCH_FIXED = "fixed"
 MATCH_REGEX = "regex"
 
+# Which log a search reads. orderStream is greped for the order id; quoteStream
+# for the order's symbol (kdb `target`.sym), and only inside the order window.
+STREAM_ORDER = "order"
+STREAM_QUOTE = "quote"
+STREAM_NAMES = {STREAM_ORDER: "orderStream", STREAM_QUOTE: "quoteStream"}
+
+# A symbol comes from kdb and reaches a shell, so it is allowlisted like an id.
+SYMBOL_RE = re.compile(r"^[A-Za-z0-9._:/\-]{1,32}$")
+
+
+def symbol_ok(sym: str) -> bool:
+    return bool(SYMBOL_RE.match(sym or ""))
+
+
+def symbol_regex(symbols: list[str]) -> str:
+    """grep -E expression matching any of ``symbols`` as a whole token.
+
+    ``0700.HK`` must not match ``10700.HK`` or ``0700.HKD``, so a symbol may not
+    touch a letter or digit on either side. Of SYMBOL_RE's characters only ``.``
+    means anything to grep -E.
+    """
+    alts = "|".join(s.replace(".", r"\.") for s in symbols)
+    return f"(^|[^A-Za-z0-9])({alts})([^A-Za-z0-9]|$)"
+
 
 class ValidationError(ValueError):
     pass
@@ -52,6 +76,13 @@ class SearchRequest:
     note: str = ""
     # Read only the order's minutes of each log, from kdb's target_state.
     order_window: bool = True
+    stream: str = STREAM_ORDER
+    # quoteStream only: the symbols to grep, from kdb. Filled in by the job.
+    symbols: list[str] = field(default_factory=list)
+
+    @property
+    def stream_name(self) -> str:
+        return STREAM_NAMES.get(self.stream, self.stream)
 
     def fingerprint(self) -> str:
         """Identity of the *search*, independent of who asked or when.
@@ -69,15 +100,22 @@ class SearchRequest:
             # substring match must not answer the new question.
             "whole-id",
         ])
+        # Added only for quoteStream, so every orderStream result cached before
+        # streams existed keeps its key.
+        if self.stream != STREAM_ORDER:
+            parts += f"|{self.stream}|{','.join(sorted(self.symbols))}"
         return hashlib.sha256(parts.encode("utf-8")).hexdigest()[:20]
 
-    def label(self) -> str:
+    def label(self, *, with_stream: bool = True) -> str:
         insts = "+".join(sorted(self.instances)) or "auto"
         if len(self.dates) == 1:
             span = self.dates[0]
         else:
             span = f"{min(self.dates)}..{max(self.dates)}"
-        return f"{self.pattern} · {insts} · {span}"
+        text = f"{self.pattern} · {insts} · {span}"
+        if with_stream and self.stream != STREAM_ORDER:
+            text += f" · {self.stream_name}"
+        return text
 
     def result_filename(self) -> str:
         """Unique, self-describing filename.
@@ -90,7 +128,8 @@ class SearchRequest:
         safe = re.sub(r"[^A-Za-z0-9._\-]", "_", self.pattern)[:40]
         insts = "-".join(sorted(self.instances))
         span = self.dates[0] if len(self.dates) == 1 else f"{min(self.dates)}-{max(self.dates)}"
-        return f"{safe}_{insts}_{span}_{self.fingerprint()[:8]}.log"
+        kind = "" if self.stream == STREAM_ORDER else f"_{self.stream}"
+        return f"{safe}_{insts}_{span}{kind}_{self.fingerprint()[:8]}.log"
 
 
 def validate(req: SearchRequest, settings: Settings) -> SearchRequest:
@@ -101,6 +140,23 @@ def validate(req: SearchRequest, settings: Settings) -> SearchRequest:
 
     if req.match_mode not in {MATCH_FIXED, MATCH_REGEX}:
         raise ValidationError(f"Unknown match mode {req.match_mode!r}.")
+
+    if req.stream not in STREAM_NAMES:
+        raise ValidationError(f"Unknown log {req.stream!r}.")
+    if req.stream == STREAM_QUOTE:
+        # The symbol and the window both come from kdb, for one exact order.
+        if not settings.kdb_enabled:
+            raise ValidationError("quoteStream needs kdb — it is not configured.")
+        if req.match_mode != MATCH_FIXED:
+            raise ValidationError("quoteStream is searched for an exact order id only, "
+                                  "not a pattern.")
+        if not kdb_id_ok(pattern):
+            raise ValidationError(
+                f"`{pattern}` cannot be a kdb id_target (a whole number up to "
+                f"{KDB_ID_MAX:,}), so its symbol cannot be looked up for quoteStream.")
+    for sym in req.symbols:
+        if not symbol_ok(sym):
+            raise ValidationError(f"Invalid symbol: {sym!r}")
 
     if req.match_mode == MATCH_FIXED:
         if not ORDER_ID_RE.match(pattern):
@@ -161,6 +217,8 @@ def validate(req: SearchRequest, settings: Settings) -> SearchRequest:
         requested_by=req.requested_by,
         note=req.note.strip()[:200],
         order_window=req.order_window,
+        stream=req.stream,
+        symbols=list(req.symbols),
     )
 
 
@@ -222,7 +280,7 @@ def build_list_command(req: SearchRequest, settings: Settings) -> str:
         for d in req.dates:
             # The filename carries the session's start date, not the trading
             # date the user picked — see Settings.log_date_offset_days.
-            pattern = f"{directory}/{settings.log_glob(inst, settings.file_date(d))}"
+            pattern = f"{directory}/{settings.log_glob(inst, settings.file_date(d), req.stream)}"
             globs.append(quote_glob(pattern))
             # After about a week the host gzips each log in place (.out ->
             # .out.gz). Look for both, so older dates are still found.
@@ -287,7 +345,14 @@ def build_grep_command(
     flags = ["-E"]
     if req.ignore_case:
         flags.append("-i")
-    expr = exact_id_regex(req.pattern) if req.match_mode == MATCH_FIXED else req.pattern
+    if req.stream == STREAM_QUOTE:
+        if not req.symbols or not all(symbol_ok(s) for s in req.symbols):
+            raise ValueError("a quoteStream grep needs valid symbols")
+        expr = symbol_regex(req.symbols)
+    elif req.match_mode == MATCH_FIXED:
+        expr = exact_id_regex(req.pattern)
+    else:
+        expr = req.pattern
     grep = f"grep {' '.join(flags)} -- {shlex.quote(expr)}"
     budget = int(max(1, settings.max_result_lines if line_budget is None else line_budget))
 

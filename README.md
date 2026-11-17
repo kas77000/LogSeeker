@@ -380,6 +380,7 @@ from **Admin → Storage**.
 | **Order id** | What to look for. Searched as literal text by default. |
 | **Instance** | Which system's logs. **Leave it empty** (with kdb configured) and the app asks kdb which instance handled the order, then searches only that one. Pick one or more to override. |
 | **Dates** | **Single date** by default, since that is almost always what you want. Switch to **Date range** above the form when you need several days. |
+| **Logs** | *With kdb configured.* **orderStream** (the default), **quoteStream**, or both — see [quoteStream](#quotestream). Each log gets its own row on the card and its own result file. |
 | **Reason** | Optional. Goes in the audit log next to your search. |
 
 ## Search type — "exact text" vs "pattern"
@@ -419,8 +420,8 @@ search first asks the OMS `target` table whether the id exists and whose it is:
 
 | Date searched | Asked of | Query |
 |---|---|---|
-| today | RDB | `select trader from target where id_target=<id>` |
-| any earlier date | HDB | `select date, trader from target where date in <dates>, id_target=<id>` |
+| today | RDB | `select trader, sym from target where id_target=<id>` |
+| any earlier date | HDB | `select date, trader, sym from target where date in <dates>, id_target=<id>` |
 
 **The `trader` column names the log folder** (`APIA`, `APIE`, …). Leave
 **Instance** empty and the app uses it: kdb first, then a grep of that instance
@@ -438,6 +439,12 @@ being down or missing an id never blocks fetching the logs.
 sent as an int. An id that is not all digits, or is over 2,147,483,647, cannot
 exist there and is not looked up; the card says why instead of a bare "not
 found". Pattern (regex) searches are not sent to kdb.
+
+Once kdb has found the order, the card has an **Order details** button. It opens
+a window with every column of the order's `target` row(s) and of its
+`workorder`s (its child orders, sorted by `t_gen`), asked of the RDB for today
+and the HDB for earlier dates, 500 rows at most each. The answer is kept while
+the page is open; **Refresh** asks kdb again, which matters for a live order.
 
 pykx connects over IPC only, so no q licence is needed. Each lookup runs in its
 own short-lived Python process (`logseeker/kdbworker/lookup.py`), so a pykx
@@ -483,6 +490,27 @@ the end of a live order's log is not cached, since the log is still being writte
 
 With one log in the search, result lines are exactly as in the log; with two or
 more, each line starts with `<file>:` so you can tell them apart.
+
+## quoteStream
+
+Tick **quoteStream** under **Logs** to also fetch the quote stream around the
+order. One search is one card: kdb is asked once, then the two logs are searched
+side by side, each with its own line count, notes and download. Searching
+orderStream first and quoteStream later is just a second search; if you tick
+both the second time, orderStream comes straight from cache.
+
+| | orderStream | quoteStream |
+|---|---|---|
+| File | `APA*_pingOrderStream_{date}*.out` | `quotestream.{yymmdd}-*.log`, e.g. `quotestream.261116-152206.log` |
+| Grepped for | the order id | the order's **symbol**, kdb `target`.sym, as a whole token (`0700.HK` does not match `10700.HK`) |
+| Where | the order's window, or the whole file when it cannot be placed | **only** the order's window — never the whole file |
+
+Both live in the instance's `logs/` folder, and both are named for the day
+before the trading date (`LOGSEEKER_LOG_DATE_OFFSET_DAYS`). quoteStream needs kdb
+and an exact order id. Its row says **Skipped**, with the reason, and reads
+nothing when kdb did not find the order, has no `sym` for it, has no
+`target_state` times for the date, or the log is gzipped: a whole day of quotes
+for a symbol is not the order. orderStream is unaffected either way.
 
 ## Running several searches at once
 
@@ -700,6 +728,7 @@ setting.
 | `KDB_TIMEOUT` | `30` | Seconds per kdb query |
 | `LOG_DIR_TEMPLATE` | `/apps/k/algologs/ap/{instance}/logs` | Where logs live |
 | `LOG_GLOB_TEMPLATE` | `APA*_pingOrderStream_{date}*.out` | Which files to scan; `.out.gz` is matched too |
+| `QUOTE_GLOB_TEMPLATE` | `quotestream.{yymmdd}-*.log` | The quoteStream log, in the same folder. `{yymmdd}` is the file date as six digits (`{date}` works too); `.log.gz` is matched too |
 | `LOG_DATE_OFFSET_DAYS` | `0` (`-1` in `.env`) | Days from trading date to the filename's date. `-1`: Monday's orders are in Sunday's file |
 | `ORDER_WINDOW_PAD_MINUTES` | `5` | Minutes either side of kdb's first/last `target_state` time when searching only the order's window |
 | `INSTANCES` | `APIA,APIB,APIC,APID,APIE,APIF,APIG,APIH,APII,APIL,APIM` | Allowlist; nothing outside it can be searched |

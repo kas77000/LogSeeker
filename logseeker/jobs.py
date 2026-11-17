@@ -31,6 +31,7 @@ from .config import Settings, get_settings
 from .remote import CommandResult, RemoteError, get_backend
 from .search import (
     MATCH_FIXED,
+    STREAM_QUOTE,
     LogFile,
     SearchRequest,
     batch_files,
@@ -40,6 +41,7 @@ from .search import (
     ValidationError,
     parse_file_list,
     split_grep_status,
+    symbol_ok,
     validate,
 )
 
@@ -53,10 +55,12 @@ class JobStatus(str, Enum):
     DONE = "done"
     FAILED = "failed"
     CANCELLED = "cancelled"
+    SKIPPED = "skipped"         # quoteStream with no symbol or window: nothing read
 
     @property
     def is_terminal(self) -> bool:
-        return self in {JobStatus.DONE, JobStatus.FAILED, JobStatus.CANCELLED}
+        return self in {JobStatus.DONE, JobStatus.FAILED, JobStatus.CANCELLED,
+                        JobStatus.SKIPPED}
 
 
 @dataclass
@@ -141,6 +145,36 @@ class Job:
 
 
 @dataclass
+class Search:
+    """One search card: kdb is asked once, then one Job per ticked stream.
+
+    ``request`` has no stream of its own; each job gets a copy with its stream
+    (and, for an automatic search, the instances kdb's trader named).
+    """
+    id: str
+    request: SearchRequest
+    streams: list[str]
+    status: JobStatus = JobStatus.QUEUED   # QUEUED → CHECKING_KDB → SEARCHING | FAILED
+    created_at: float = field(default_factory=time.time)
+    kdb: "kdb.KdbCheck | None" = None
+    auto_instances: bool = False
+    warnings: list[str] = field(default_factory=list)
+    error: str = ""                        # the card failed before any job started
+    jobs: list[Job] = field(default_factory=list)
+
+    @property
+    def is_terminal(self) -> bool:
+        if self.status is JobStatus.FAILED:
+            return True
+        return (self.status is JobStatus.SEARCHING
+                and all(j.status.is_terminal for j in self.jobs))
+
+    def cancel(self) -> None:
+        for j in self.jobs:
+            j.cancel()
+
+
+@dataclass
 class ScanItem:
     """One log and the part of it to read: bytes [start, end), end None = EOF."""
     path: str
@@ -163,7 +197,12 @@ def trade_date_for(path: str, dates: list[str], settings: Settings) -> str | Non
     """The requested trading date (YYYYMMDD) a log file belongs to, by the
     date stamped in its name. None when that is not unambiguous."""
     name = path.rsplit("/", 1)[-1]
-    hits = [d for d in dates if settings.file_date(d) in name]
+    hits = []
+    for d in dates:
+        stamp = settings.file_date(d)
+        # orderStream: ..._20261116[..]; quoteStream: quotestream.261116-152206
+        if stamp in name or f".{stamp[2:]}-" in name:
+            hits.append(d)
     return hits[0] if len(hits) == 1 else None
 
 
@@ -181,6 +220,7 @@ class JobManager:
     def __init__(self, settings: Settings):
         self.settings = settings
         self._jobs: "OrderedDict[str, Job]" = OrderedDict()
+        self._searches: "OrderedDict[str, Search]" = OrderedDict()
         self._lock = threading.RLock()
         self._pool = ThreadPoolExecutor(
             max_workers=max(1, settings.workers),
@@ -214,15 +254,21 @@ class JobManager:
 
     # -- public API --------------------------------------------------------- #
 
-    def submit(self, request: SearchRequest) -> Job:
-        """Queue a search — or hand back an equivalent one already in flight."""
+    def submit(self, request: SearchRequest, *, kdb_check: "kdb.KdbCheck | None" = None,
+               auto_instances: bool = False) -> Job:
+        """Queue a search — or hand back an equivalent one already in flight.
+
+        ``kdb_check`` is the answer a card already got from kdb; the job then
+        uses it instead of asking again.
+        """
         fingerprint = request.fingerprint()
         with self._lock:
             for job in reversed(self._jobs.values()):
                 if job.request.fingerprint() == fingerprint and not job.status.is_terminal:
                     return job
 
-            job = Job(id=uuid.uuid4().hex[:10], request=request)
+            job = Job(id=uuid.uuid4().hex[:10], request=request, kdb=kdb_check,
+                      auto_instances=auto_instances)
             self._jobs[job.id] = job
             while len(self._jobs) > self.settings.job_history:
                 self._jobs.popitem(last=False)
@@ -236,10 +282,73 @@ class JobManager:
             instances=request.instances,
             dates=request.dates,
             match_mode=request.match_mode,
+            stream=request.stream,
             note=request.note,
         )
         self._pool.submit(self._run, job)
         return job
+
+    def submit_search(self, request: SearchRequest, streams: list[str]) -> Search:
+        """Start a card: ask kdb once, then one job per stream (in that order)."""
+        search = Search(id=uuid.uuid4().hex[:10], request=request,
+                        streams=list(dict.fromkeys(streams)))
+        with self._lock:
+            self._searches[search.id] = search
+            while len(self._searches) > self.settings.job_history:
+                self._searches.popitem(last=False)
+        self._pool.submit(self._prepare, search)
+        return search
+
+    def get_search(self, search_id: str) -> Search | None:
+        with self._lock:
+            return self._searches.get(search_id)
+
+    def _prepare(self, search: Search) -> None:
+        """kdb once, the instance from its trader if none was picked, then the jobs.
+
+        Runs on the pool and only *queues* the jobs — it never waits on them, so
+        it cannot hold a worker that a job of its own needs.
+        """
+        settings = self.settings
+        req = search.request
+        try:
+            check = None
+            if settings.kdb_enabled:
+                search.status = JobStatus.CHECKING_KDB
+                check = kdb.lookup_target(settings, req.pattern, req.dates,
+                                          exact=req.match_mode == MATCH_FIXED)
+                search.kdb = check
+                audit.record(settings.audit_path, "kdb_checked", search_id=search.id,
+                             user=req.requested_by, pattern=req.pattern,
+                             status=check.status, traders=check.traders,
+                             symbols=check.symbols, message=check.message)
+
+            if not req.instances:
+                instances, warnings, error = resolve_instances(check, settings)
+                search.warnings.extend(warnings)
+                if not error:
+                    try:
+                        req = validate(replace(req, instances=instances), settings)
+                    except ValidationError as exc:
+                        error = str(exc)
+                if error:
+                    search.error = error
+                    search.status = JobStatus.FAILED
+                    audit.record(settings.audit_path, "search_failed", search_id=search.id,
+                                 user=req.requested_by, error=error, kind="instance")
+                    return
+                search.request, search.auto_instances = req, True
+                audit.record(settings.audit_path, "instances_from_kdb", search_id=search.id,
+                             user=req.requested_by, instances=instances)
+
+            for stream in search.streams:
+                search.jobs.append(self.submit(
+                    replace(req, stream=stream, symbols=[]), kdb_check=check,
+                    auto_instances=search.auto_instances))
+            search.status = JobStatus.SEARCHING
+        except Exception as exc:  # noqa: BLE001 - shown on the card
+            search.error = f"{type(exc).__name__}: {exc}"
+            search.status = JobStatus.FAILED
 
     def get(self, job_id: str) -> Job | None:
         with self._lock:
@@ -268,27 +377,37 @@ class JobManager:
         """
         settings, req = self.settings, job.request
         items = [ScanItem(f.path, f.size_bytes) for f in files]
-        if not (req.order_window and settings.kdb_enabled and req.match_mode == MATCH_FIXED):
+        # quoteStream is only ever read inside the window: a file whose window
+        # cannot be placed is left out, never read whole. Its notes then say
+        # "not read" instead of "whole file".
+        quote = req.stream == STREAM_QUOTE
+        if not quote and not (req.order_window and settings.kdb_enabled
+                              and req.match_mode == MATCH_FIXED):
             return items
 
         check = job.kdb
         if check is None or check.status != kdb.FOUND:
             reason = check.message if check is not None else "kdb was not asked."
+            if quote:
+                self._set(job, scan_notes=[f"Not read — no order window from kdb ({reason})"])
+                return []
             self._set(job, scan_notes=[f"Whole file — no order window from kdb ({reason})"])
             return items
 
         self._set(job, status=JobStatus.LOCATING)
         pad = max(0, settings.order_window_pad_minutes) * 60_000
+        fallback = "not read" if quote else "whole file"
         notes: list[str] = []
+        kept: list[ScanItem] = []
         for item in items:
             name = item.path.rsplit("/", 1)[-1]
             if item.path.endswith(".gz"):
-                notes.append(f"{name}: whole file — gzipped, so it cannot be jumped into")
+                notes.append(f"{name}: {fallback} — gzipped, so it cannot be jumped into")
                 continue
             day = trade_date_for(item.path, req.dates, settings)
             win = window.order_window(check.states, day) if day else None
             if win is None:
-                notes.append(f"{name}: whole file — kdb has no timed target_state row "
+                notes.append(f"{name}: {fallback} — kdb has no timed target_state row "
                              f"for {day or 'this file'}")
                 continue
 
@@ -298,9 +417,10 @@ class JobManager:
             try:
                 item.start, item.end = window.find_range(probe, item.size_bytes, win, pad)
             except window.WindowError as exc:
-                notes.append(f"{name}: whole file — {exc}")
+                notes.append(f"{name}: {fallback} — {exc}")
                 continue
             item.windowed = True
+            kept.append(item)
             upto = "end of file" if win.open_ended else window.fmt_clock(win.last_ms + pad)
             notes.append(
                 f"{name}: {window.fmt_clock(win.first_ms - pad)} → {upto} · "
@@ -309,7 +429,30 @@ class JobManager:
             )
             self._set(job, scan_notes=list(notes))
         self._set(job, scan_notes=notes)
-        return items
+        return kept if quote else items
+
+    def _skip(self, job: Job, reason: str) -> None:
+        """quoteStream that could not be placed: nothing was read, and why."""
+        self._set(job, status=JobStatus.SKIPPED, finished_at=time.time(),
+                  error=f"Not searched — {reason}")
+        audit.record(self.settings.audit_path, "search_skipped", job_id=job.id,
+                     user=job.request.requested_by, pattern=job.request.pattern,
+                     stream=job.request.stream, reason=reason)
+
+    def _quote_symbols(self, job: Job) -> str:
+        """Give a quoteStream job its symbols from kdb. Returns why not, or ""."""
+        check = job.kdb
+        if check is None or check.status != kdb.FOUND:
+            why = check.message if check is not None else "kdb was not asked."
+            return f"quoteStream needs the order in kdb. {why}"
+        symbols = check.symbols
+        if not symbols:
+            return "kdb has no symbol (`target`.sym) for this order."
+        bad = [s for s in symbols if not symbol_ok(s)]
+        if bad:
+            return f"kdb's symbol {bad[0]!r} cannot be searched safely."
+        self._set(job, request=replace(job.request, symbols=symbols))
+        return ""
 
     def _probe(self, sess, job: Job, path: str, offset: int, length: int) -> bytes:
         """``length`` bytes of ``path`` from ``offset``, read on the log host."""
@@ -413,7 +556,8 @@ class JobManager:
         # The cheap question first: does kdb know this id_target, and whose is
         # it? Informational only — a kdb outage or a miss never stops the grep,
         # because the logs are the authority this app exists to fetch.
-        if settings.kdb_enabled:
+        # A card asks kdb once for all its streams and hands the answer in.
+        if settings.kdb_enabled and job.kdb is None:
             self._set(job, status=JobStatus.CHECKING_KDB)
             check = kdb.lookup_target(settings, job.request.pattern, job.request.dates,
                                       exact=job.request.match_mode == "fixed")
@@ -425,6 +569,14 @@ class JobManager:
 
         if not job.request.instances:
             if not self._resolve_instances(job):
+                return
+
+        # quoteStream greps the order's symbol, which only kdb knows. Before the
+        # cache lookup: the symbol is part of the cache key.
+        if job.request.stream == STREAM_QUOTE:
+            reason = self._quote_symbols(job)
+            if reason:
+                self._skip(job, reason)
                 return
 
         self._set(job, status=JobStatus.LISTING)
@@ -501,6 +653,9 @@ class JobManager:
 
                 # --- step 1b: narrow each log to the order's minutes ----------
                 items = self._plan_ranges(job, sess, files)
+                if not items:           # quoteStream: no file had a window
+                    self._skip(job, "; ".join(job.scan_notes) or "no order window from kdb.")
+                    return
                 total_bytes = sum(i.length for i in items)
                 self._set(job, bytes_to_scan=total_bytes)
 
@@ -533,7 +688,7 @@ class JobManager:
                 deadline = time.time() + settings.command_timeout
                 # One log searched: lines come back exactly as in the log. Two
                 # or more: each line says which file it came from.
-                prefix = len(files) > 1
+                prefix = len(items) > 1
 
                 with out_path.open("wb") as fh:
                     def sink(chunk: bytes) -> None:
@@ -550,9 +705,11 @@ class JobManager:
                     # Nothing inside the window. kdb said the order lived then,
                     # so either the log host's clock disagrees with kdb's or the
                     # lines are not where expected — read the whole file rather
-                    # than answer "no match" from a guess.
+                    # than answer "no match" from a guess. Not for quoteStream:
+                    # a whole day of quotes for a symbol is not the order.
                     windowed = [i for i in items if i.windowed]
-                    if windowed and written["lines"] == 0 and not _cut_short(result):
+                    if (windowed and written["lines"] == 0 and not _cut_short(result)
+                            and job.request.stream != STREAM_QUOTE):
                         whole = [ScanItem(i.path, i.size_bytes) for i in windowed]
                         extra = sum(i.length for i in whole)
                         if job.bytes_to_scan + extra > settings.max_scan_bytes:

@@ -17,7 +17,7 @@ itself on sys.path — LogSeeker's modules (config, search, store…) cannot sha
 anything pykx imports.
 
 Request:
-    {"op": "lookup" | "ping",
+    {"op": "lookup" | "details" | "ping",
      "rdb": ["host", port] | null, "hdb": ["host", port] | null,
      "username": "", "password": "", "timeout": 30,
      "id": "540000001" (digits; sent to kdb as an int), "hdb_dates": ["2026-11-12", ...], "max_rows": 100}
@@ -30,6 +30,9 @@ Answer:
                               "last_state": "filled"}],
                   "states_error": null | "...",
                   "error": null | "...", "info": "..."}]}
+
+    "details" answers with "target" and "workorder" (every column, rows as
+    dicts) and "target_error" / "workorder_error" per source instead.
 """
 
 from __future__ import annotations
@@ -47,13 +50,25 @@ TABLE = "target"
 # The RDB holds only the current session in memory, so its query has no date
 # predicate. The HDB is partitioned by date, so `date in ds` comes first.
 RDB_FN = """
-{[x;n] n sublist distinct select trader from target where id_target=x }
+{[x;n] n sublist distinct select trader, sym from target where id_target=x }
 """
 
 HDB_FN = """
-{[ds;x;n] n sublist distinct select date, trader from target
+{[ds;x;n] n sublist distinct select date, trader, sym from target
     where date in ds, id_target=x }
 """
+
+# Order details: every column of the order and of its children. workorder sits
+# on the same order server as target and links by id_target (kdb-queries,
+# luld_orders): no date on the RDB, the date predicate first on the HDB.
+DETAILS_RDB = {
+    "target": "{[x;n] n sublist select from target where id_target=x }",
+    "workorder": "{[x;n] n sublist select from workorder where id_target=x }",
+}
+DETAILS_HDB = {
+    "target": "{[ds;x;n] n sublist select from target where date in ds, id_target=x }",
+    "workorder": "{[ds;x;n] n sublist select from workorder where date in ds, id_target=x }",
+}
 
 # When did the order live, and is it still live? One row per id_server (and
 # date on the HDB): first and last `time`, and the state at the last one.
@@ -118,7 +133,65 @@ def _rows(table) -> list[dict]:
     out = []
     for record in frame.to_dict("records"):
         out.append({"date": _text(record.get("date")),
-                    "trader": _text(record.get("trader"))})
+                    "trader": _text(record.get("trader")),
+                    "sym": _text(record.get("sym"))})
+    return out
+
+
+def _clock(ms: int) -> str:
+    return f"{ms // 3600000:02d}:{ms // 60000 % 60:02d}:{ms // 1000 % 60:02d}.{ms % 1000:03d}"
+
+
+def _plain(value):
+    """Any q value from a pykx table as something json.dumps takes.
+
+    Dates as YYYY-MM-DD, timestamps with milliseconds, times and timespans as
+    HH:MM:SS.mmm, symbols and strings as text, nulls as None.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value).decode("utf-8", "replace")
+    if isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        return None if value != value else value
+    if str(value) in {"NaT", "nan", "NaN", "None"}:
+        return None
+    if isinstance(value, dt.datetime):                   # pandas Timestamp too
+        if (value.hour, value.minute, value.second, value.microsecond) == (0, 0, 0, 0):
+            return value.date().isoformat()
+        return value.isoformat(sep=" ", timespec="milliseconds")
+    if isinstance(value, dt.date):
+        return value.isoformat()
+    if isinstance(value, dt.time) or hasattr(value, "total_seconds"):
+        ms = _ms(value)
+        return None if ms is None else _clock(ms)
+    if getattr(value, "ndim", None) == 0 and hasattr(value, "item"):   # numpy scalar
+        return _plain(value.item())
+    if hasattr(value, "tolist") or isinstance(value, (list, tuple)):   # q list cell
+        items = value.tolist() if hasattr(value, "tolist") else value
+        return " ".join(str(_plain(v)) for v in items)
+    return str(value)
+
+
+def _records(table) -> list[dict]:
+    """Every column of a pykx table, as JSON-safe dicts."""
+    frame = table.pd()
+    return [{str(k): _plain(v) for k, v in record.items()}
+            for record in frame.to_dict("records")]
+
+
+def _details(conn, fns: dict, args: tuple, n) -> dict:
+    """Each table in its own try: a failed workorder query keeps the target."""
+    out = {}
+    for name, fn in fns.items():
+        try:
+            out[name] = _records(conn(fn, *args, n))
+            out[f"{name}_error"] = None
+        except Exception as exc:  # noqa: BLE001 - shown in that section only
+            out[name] = []
+            out[f"{name}_error"] = f"{type(exc).__name__}: {exc}"
     return out
 
 
@@ -193,16 +266,19 @@ def handle(req: dict) -> dict:
         return {"sources": sources}
 
     ident = kx.toq(int(req["id"]), ktype=kx.IntAtom)
+    details = op == "details"
 
     if req.get("rdb"):
-        sources.append(_one(kx, "RDB", req["rdb"], req,
-                            lambda conn: _lookup(conn, RDB_FN, RDB_STATE_FN, (ident,), n)))
+        sources.append(_one(kx, "RDB", req["rdb"], req, (
+            (lambda conn: _details(conn, DETAILS_RDB, (ident,), n)) if details else
+            (lambda conn: _lookup(conn, RDB_FN, RDB_STATE_FN, (ident,), n)))))
 
     dates = [dt.date.fromisoformat(d) for d in req.get("hdb_dates") or []]
     if dates and req.get("hdb"):
         ds = kx.toq(dates, ktype=kx.DateVector)
-        sources.append(_one(kx, "HDB", req["hdb"], req,
-                            lambda conn: _lookup(conn, HDB_FN, HDB_STATE_FN, (ds, ident), n)))
+        sources.append(_one(kx, "HDB", req["hdb"], req, (
+            (lambda conn: _details(conn, DETAILS_HDB, (ds, ident), n)) if details else
+            (lambda conn: _lookup(conn, HDB_FN, HDB_STATE_FN, (ds, ident), n)))))
 
     return {"sources": sources}
 
