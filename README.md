@@ -341,6 +341,16 @@ Then start it for the network:
 `run.ps1` prints the link to share, the account searches will run as, and warns
 if you have no network restriction. For a local-only test use `.\run.ps1 -LocalOnly`.
 
+If unsigned PowerShell scripts are blocked on your machine (*"run.ps1 is not
+digitally signed"*), double-click **`run.cmd`** instead: it runs `run.ps1 -LocalOnly`
+with the execution policy bypassed for that one call, from any folder. Edit
+`run.cmd` and remove `-LocalOnly` to serve the network.
+
+To stop the app, double-click **`stop.cmd`** (or press Ctrl+C in its window). It
+ends whatever listens on port 8510, with its search and kdb workers, but only if
+that is Streamlit; another app on the port is left alone. For a different port:
+`stop.cmd 8600`.
+
 > Streamlit prints an `External URL` on startup. If that address is genuinely
 > routable from outside your organisation, anyone who finds it can read
 > production order logs as `LOGSEEKER_SSH_USER`. Check with your network team
@@ -694,7 +704,7 @@ Reach for these in order — the first is usually enough:
 | **Colleagues cannot reach it at all** | Firewall rule missing (step 7), or started without `run.ps1` so it bound to localhost. |
 | **"Search hit the time limit"** | Expected on very wide ranges — partial results are kept and the warning says how far it got. Narrow the range, or raise `LOGSEEKER_COMMAND_TIMEOUT`. |
 | **"That search would scan N GB… over the limit"** | Working as intended. Narrow the range or pick one instance; raise `LOGSEEKER_MAX_SCAN_BYTES` only deliberately. |
-| **Progress bar sits at 0% for a long time** | The first batch is still running. Batches are 512 MB by default; lower `LOGSEEKER_SCAN_BATCH_BYTES` for finer updates. |
+| **Scanned figure sits at 0 for a long time** | The first batch is still running. Batches are 512 MB by default; lower `LOGSEEKER_SCAN_BATCH_BYTES` for finer updates. |
 | **Everything is slow with several people using it** | Lower `LOGSEEKER_WORKERS`. Identical searches already share one grep and are cached. |
 | **A setting you changed has no effect** | A comment after the value: `=3600  # one hour` is not a number, so the default is used. The app now says so on every page and in **Admin → Health**. Put comments on their own line. |
 | **Disk filling up** | It is bounded by `LOGSEEKER_MAX_DISK_BYTES`. Lower it, or lower `CACHE_TTL_HOURS`. |
@@ -795,6 +805,7 @@ A visitor can search the logs. They cannot run commands on the host.
 
 ```
 run.ps1                launcher: prints the share link and the account in use
+run.cmd / stop.cmd     double-click start (policy bypass) and stop
 streamlit_app.py       network guard, navigation, shared sidebar
 app_pages/
   search.py            request form + live progress panel
