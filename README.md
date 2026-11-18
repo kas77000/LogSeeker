@@ -468,7 +468,7 @@ starts with an `HH:MM:SS,mmm` timestamp and the file is in time order, so it rea
 64 KB in the middle, looks at the timestamp, halves, and repeats: a few dozen
 small reads place the window in any file, however big. Only that byte range is
 grepped (`tail -c +START | head -c LENGTH | grep`), so a search that read 145 GB
-reads a gigabyte or so, and the progress bar measures that range.
+reads a gigabyte or so, and the scanned size counts only that range.
 
 Times are HKT on both sides. The session start is taken from the log's first
 line, not from the `[HH-MM-SS]` in its name, so a session that runs past midnight
@@ -516,7 +516,7 @@ for a symbol is not the order. orderStream is unaffected either way.
 
 You do not have to wait. Submit a search, and while it is scanning you can
 submit another — each one gets its own status card showing queued, scanning with
-a progress bar, or finished with a download button. Cards stay until you dismiss
+a live count of matching lines, or finished with a download button. Cards stay until you dismiss
 them.
 
 Three searches run at a time by default (`LOGSEEKER_WORKERS`); beyond that they
@@ -585,7 +585,7 @@ everything on screen keep using the real trading date.
 After about a week the host **gzips each log** (`.out` → `.out.gz`). The app
 looks for both and decompresses on the log host while searching, so older dates
 work. Logs older than about two weeks are deleted from the host, and no tool can
-search those. For compressed files the size shown and the progress bar reflect
+search those. For compressed files the size shown and the scanned figure reflect
 the compressed size, so a compressed day reads as smaller than it really is.
 
 ## Knowing what you are about to scan
@@ -594,8 +594,8 @@ The file listing uses `du -k`, so before any reading starts the app knows how
 many files there are **and how big they are**. That one change is what makes
 gigabyte logs manageable:
 
-- **A real progress bar.** Fraction of *log bytes read*, not time elapsed against
-  the timeout. On a ten-minute scan the latter tells you nothing.
+- **A real scanned figure.** *Log bytes read* out of the total, not time elapsed
+  against the timeout. On a ten-minute scan the latter tells you nothing.
 - **An ETA**, from measured throughput once enough has been read to be honest.
 - **A pre-flight refusal.** A search over more than `MAX_SCAN_BYTES` (200 GB) is
   rejected with the actual figure — *"would scan 340 GB across 312 files"* —
@@ -817,7 +817,7 @@ A search runs in two steps against the log host, over a single SSH connection:
 
 1. `du -k <globs>` resolves which log files exist **and how big they are**. This
    gives an accurate "no logs for that date" message, the scan size to check
-   against `MAX_SCAN_BYTES`, a denominator for the progress bar, and lets step 2
+   against `MAX_SCAN_BYTES`, a denominator for the scanned figure, and lets step 2
    avoid shell globbing entirely.
 2. `grep -F -- 'pattern' <explicit quoted file list> /dev/null | head -n N`, run
    once per ~512 MB batch with `N` set to the *remaining* line budget. The

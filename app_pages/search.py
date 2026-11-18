@@ -263,9 +263,6 @@ def render_stream(j, *, live: bool) -> None:
                 f"{ui.human_duration(j.elapsed)} elapsed"
                 + (f" · about {ui.human_duration(eta)} left" if eta and eta > 2 else "")
             )
-            # Fraction of log actually read, not time elapsed against the
-            # timeout — on a gigabyte scan the latter tells you nothing.
-            st.progress(j.scan_fraction)
 
         for warning in j.warnings:
             st.warning(warning, icon=":material/warning:")
