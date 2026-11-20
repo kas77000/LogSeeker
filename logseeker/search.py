@@ -279,8 +279,9 @@ def build_list_command(req: SearchRequest, settings: Settings) -> str:
         directory = settings.log_dir(inst)
         for d in req.dates:
             # The filename carries the session's start date, not the trading
-            # date the user picked — see Settings.log_date_offset_days.
-            pattern = f"{directory}/{settings.log_glob(inst, settings.file_date(d), req.stream)}"
+            # date the user picked — see Settings.log_date_offset_days (not
+            # applied to same_day_instances, the Asia servers).
+            pattern = f"{directory}/{settings.log_glob(inst, settings.file_date(d, inst), req.stream)}"
             globs.append(quote_glob(pattern))
             # After about a week the host gzips each log in place (.out ->
             # .out.gz). Look for both, so older dates are still found.

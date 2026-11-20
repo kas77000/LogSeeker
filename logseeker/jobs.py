@@ -197,9 +197,10 @@ def trade_date_for(path: str, dates: list[str], settings: Settings) -> str | Non
     """The requested trading date (YYYYMMDD) a log file belongs to, by the
     date stamped in its name. None when that is not unambiguous."""
     name = path.rsplit("/", 1)[-1]
+    instance = settings.instance_of(path)
     hits = []
     for d in dates:
-        stamp = settings.file_date(d)
+        stamp = settings.file_date(d, instance)
         # orderStream: ..._20261116[..]; quoteStream: quotestream.261116-152206
         if stamp in name or f".{stamp[2:]}-" in name:
             hits.append(d)

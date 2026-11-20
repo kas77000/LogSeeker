@@ -592,6 +592,10 @@ Monday's orders are in the file named for Sunday and Friday's in Thursday's.
 `LOGSEEKER_LOG_DATE_OFFSET_DAYS=-1` makes the app do that conversion. kdb and
 everything on screen keep using the real trading date.
 
+**APIL and APIM are the exception.** They are Asia servers: their session starts
+on the trading day, so their files carry the trading date itself and no shift is
+applied. The list is `LOGSEEKER_SAME_DAY_INSTANCES` (default `APIL,APIM`).
+
 After about a week the host **gzips each log** (`.out` → `.out.gz`). The app
 looks for both and decompresses on the log host while searching, so older dates
 work. Logs older than about two weeks are deleted from the host, and no tool can
@@ -740,6 +744,7 @@ setting.
 | `LOG_GLOB_TEMPLATE` | `APA*_pingOrderStream_{date}*.out` | Which files to scan; `.out.gz` is matched too |
 | `QUOTE_GLOB_TEMPLATE` | `quotestream.{yymmdd}-*.log` | The quoteStream log, in the same folder. `{yymmdd}` is the file date as six digits (`{date}` works too); `.log.gz` is matched too |
 | `LOG_DATE_OFFSET_DAYS` | `0` (`-1` in `.env`) | Days from trading date to the filename's date. `-1`: Monday's orders are in Sunday's file |
+| `SAME_DAY_INSTANCES` | `APIL,APIM` | Instances whose files carry the trading date itself (Asia servers); the offset above is not applied to them |
 | `ORDER_WINDOW_PAD_MINUTES` | `5` | Minutes either side of kdb's first/last `target_state` time when searching only the order's window |
 | `INSTANCES` | `APIA,APIB,APIC,APID,APIE,APIF,APIG,APIH,APII,APIL,APIM` | Allowlist; nothing outside it can be searched |
 | `ALLOWED_NETWORKS` | *(empty)* | CIDR allowlist. The app's only access control. |

@@ -139,6 +139,9 @@ class Settings:
     # log filename. The US side starts each session the afternoon before, so
     # Monday's orders are in the file named for Sunday: -1. 0 = no shift.
     log_date_offset_days: int = 0
+    # Asia-side instances start their session on the trading day itself, so
+    # their files carry the trading date: the offset above is not applied.
+    same_day_instances: list[str] = field(default_factory=lambda: ["APIL", "APIM"])
     # Order-time window search: minutes added either side of kdb's first and last
     # target_state time before the log is narrowed to that range.
     order_window_pad_minutes: int = 5
@@ -223,12 +226,28 @@ class Settings:
         template = self.quote_glob_template if stream == "quote" else self.log_glob_template
         return template.format(instance=instance, date=date, yymmdd=date[2:])
 
-    def file_date(self, trade_date: str) -> str:
-        """YYYYMMDD stamped in the log filename for a YYYYMMDD trading date."""
-        if not self.log_date_offset_days:
+    def file_date(self, trade_date: str, instance: str | None = None) -> str:
+        """YYYYMMDD stamped in the log filename for a YYYYMMDD trading date.
+
+        ``instance`` matters: same_day_instances (the Asia servers) log under
+        the trading date itself, every other instance under the offset date.
+        """
+        if not self.log_date_offset_days or self.same_day(instance):
             return trade_date
         day = datetime.strptime(trade_date, "%Y%m%d") + timedelta(days=self.log_date_offset_days)
         return day.strftime("%Y%m%d")
+
+    def same_day(self, instance: str | None) -> bool:
+        """True for an instance whose log files carry the trading date unshifted."""
+        wanted = {i.upper() for i in self.same_day_instances}
+        return instance is not None and instance.upper() in wanted
+
+    def instance_of(self, path: str) -> str | None:
+        """The configured instance whose log directory holds ``path``."""
+        for inst in self.instances:
+            if path.startswith(self.log_dir(inst).rstrip("/") + "/"):
+                return inst
+        return None
 
     def describe_target(self) -> str:
         if self.backend == "local":
@@ -270,6 +289,7 @@ def get_settings() -> Settings:
         log_glob_template=_get("log_glob_template", "APA*_pingOrderStream_{date}*.out"),
         quote_glob_template=_get("quote_glob_template", "quotestream.{yymmdd}-*.log"),
         log_date_offset_days=_get_int("log_date_offset_days", 0),
+        same_day_instances=_get_list("same_day_instances", ["APIL", "APIM"]),
         order_window_pad_minutes=_get_int("order_window_pad_minutes", 5),
         instances=_get_list("instances", ["APIA", "APIB", "APIC", "APID", "APIE", "APIF", "APIG", "APIH", "APII", "APIL", "APIM"]),
         backend=str(_get("backend", "ssh")).lower(),

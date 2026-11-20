@@ -110,9 +110,9 @@ with tab_health:
             import io
 
             req = SearchRequest(pattern="x", instances=[p_instance], dates=[p_date])
-            if settings.file_date(p_date) != p_date:
+            if settings.file_date(p_date, p_instance) != p_date:
                 st.caption(f"Trading date {p_date} is in the log file dated "
-                           f"**{settings.file_date(p_date)}** "
+                           f"**{settings.file_date(p_date, p_instance)}** "
                            f"(LOGSEEKER_LOG_DATE_OFFSET_DAYS={settings.log_date_offset_days}).")
             buf = io.BytesIO()
             with st.spinner("Listing…"):
@@ -221,6 +221,7 @@ with tab_config:
         "log_glob_template": settings.log_glob_template,
         "quote_glob_template": settings.quote_glob_template,
         "log_date_offset_days": settings.log_date_offset_days,
+        "same_day_instances": ", ".join(settings.same_day_instances) or "(none)",
         "order_window_pad_minutes": settings.order_window_pad_minutes,
         "instances": ", ".join(settings.instances),
         "workers": settings.workers,

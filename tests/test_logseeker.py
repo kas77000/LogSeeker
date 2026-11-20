@@ -284,6 +284,35 @@ def test_trading_date_maps_to_the_previous_days_file(settings):
     assert ".out.gz" in cmd, "compressed logs must be listed too"
 
 
+
+def test_asia_instances_use_the_trading_date_itself(settings):
+    from dataclasses import replace
+
+    from logseeker.jobs import trade_date_for
+
+    shifted = replace(settings, log_date_offset_days=-1,
+                      instances=[*settings.instances, "APIL", "APIM"])
+    assert shifted.same_day_instances == ["APIL", "APIM"]
+    for asia in ("APIL", "APIM", "apil"):
+        assert shifted.file_date("20261109", asia) == "20261109"
+    assert shifted.file_date("20261109", "APIA") == "20261108"
+    assert shifted.file_date("20261109") == "20261108"
+
+    cmd = build_list_command(
+        validate(req(instances=["APIA", "APIL"], dates=["20261109"]), shifted), shifted)
+    assert f"{shifted.log_dir('APIA')}/APA*_pingOrderStream_20261108" in cmd
+    assert f"{shifted.log_dir('APIL')}/APA*_pingOrderStream_20261109" in cmd
+    assert f"{shifted.log_dir('APIL')}/APA*_pingOrderStream_20261108" not in cmd
+
+    # A file is matched back to its trading date with its own instance's rule.
+    apil = f"{shifted.log_dir('APIL')}/APA1_pingOrderStream_20261109[01-00-00].out"
+    apia = f"{shifted.log_dir('APIA')}/APA1_pingOrderStream_20261109[15-00-00].out"
+    assert trade_date_for(apil, ["20261109", "20261110"], shifted) == "20261109"
+    assert trade_date_for(apia, ["20261109", "20261110"], shifted) == "20261110"
+
+    none = replace(shifted, same_day_instances=[])
+    assert none.file_date("20261109", "APIL") == "20261108"
+
 @pytest.mark.skipif(not all(shutil.which(t) for t in ("grep", "gzip", "awk")),
                     reason="needs grep, gzip and awk on PATH")
 def test_end_to_end_over_plain_and_gzipped_logs_with_real_names(settings, tmp_path):
