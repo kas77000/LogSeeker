@@ -411,12 +411,8 @@ def _table(title: str, rows: list[dict], error: str | None, empty: str, *,
             st.warning(error, icon=":material/warning:")
         elif not rows:
             st.caption(empty)
-        elif len(rows) == 1:
-            # One row of many columns reads better down the page than across it.
-            st.dataframe([{"column": k, "value": "" if v is None else str(v)}
-                          for k, v in rows[0].items()],
-                         hide_index=True, use_container_width=True)
         else:
+            # The kdb column names are the header, whatever the row count.
             st.dataframe(rows, hide_index=True, use_container_width=True)
 
 

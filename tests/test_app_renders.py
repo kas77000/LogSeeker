@@ -319,6 +319,9 @@ def test_order_details_dialog_shows_target_and_workorders(monkeypatch):
     assert "**target** · 1 row(s)" in sections, sections
     assert "**workorder** · 2 row(s)" in sections, sections
     assert len(at.dataframe) == 2
+    target, workorder = (list(d.value.columns) for d in at.dataframe)
+    assert target == ["date", "id_target", "sym"], "kdb columns are the header"
+    assert workorder == ["id_work", "t_gen"]
 
     at.run()                                            # reopened from the session
     _no_exceptions(at)
